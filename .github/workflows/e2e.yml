@@ -1,0 +1,63 @@
+name: Spark Operator E2E Test Suites
+run-name: ${{ github.actor }} is testing out GitHub Actions 🚀
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+# Cancel previous PR build and test
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  build-spark-operator-image:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Build Operator Image
+        run: echo "I have build the image version"
+    outputs:
+      image_version: "experiment-1.0.0"
+  e2e-tests:
+    needs: build-spark-operator-image
+    runs-on: ubuntu-latest
+    steps:
+#      - name: setup-minikube
+#        uses: medyagh/setup-minikube@v0.0.18
+#        with:
+#          cache: true
+#        id: install-minikube
+#      - name: set-up-helm
+#        uses: azure/setup-helm@v4.2.0
+#        with:
+#          version: latest
+#          cache: true
+#        id: install-helm
+#      - name: setup-chainsaw
+#        uses: kyverno/action-install-chainsaw@v0.2.7
+#        with:
+#          cache: true
+#        id: install-chainsaw
+      - name: install-spark-operator
+        env:
+          SPARK_OPERATOR_E2E_VERSION: ${{ needs.build-spark-operator-image.outputs.image_version }}
+        run: |
+          echo "I got docker image version $SPARK_OPERATOR_E2E_VERSION"
+          kubectl get pods -A
+          chainsaw version
+          helm version
+  e2e-tests-check:
+    runs-on: ubuntu-latest
+    needs: [e2e-tests]
+    steps:
+      - name: Print result
+        run: echo ${{ needs.e2e-tests.result }}
