@@ -1,0 +1,30 @@
+apiVersion: org.apache.spark/v1alpha1
+kind: SparkApplication
+metadata:
+  name: ($SPARK_APPLICATION_NAME)
+  namespace: default
+spec:
+  driverSpec:
+    podTemplateSpec:
+      metadata:
+      spec:
+        containers:
+          - name: driver
+            workingDir: /opt/spark
+  executorSpec:
+    podTemplateSpec:
+      metadata:
+      spec:
+        containers:
+          - name: executor
+            workingDir: /opt/spark
+  sparkRFiles: "local:///opt/spark/examples/src/main/r/dataframe.R"
+  sparkConf:
+    spark.executor.instances: "1"
+    # see also https://hub.docker.com/_/spark
+    # this is the same as spark:3.5.1-java17-r
+    spark.kubernetes.container.image: ($IMAGE)
+    spark.kubernetes.authenticate.driver.serviceAccountName: "spark"
+    spark.home: "/opt/spark"
+  runtimeVersions:
+    sparkVersion: ($V_SPARK_VERSION)

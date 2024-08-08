@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ($SPARK_DRIVER_POD_NAME)
+  namespace: default
+spec:
+  containers:
+  - name: driver
+  volumes:
+    - name: spark-conf-volume-driver
+      configMap:
+        name: ($SPARK_DRIVER_CONFIG_MAP_NAME)

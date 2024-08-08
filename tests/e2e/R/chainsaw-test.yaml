@@ -1,0 +1,34 @@
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: spark-operator-r-language-validation
+spec:
+  scenarios:
+    - bindings:
+        - name: "SPARK_VERSION"
+          value: "3.5.1"
+        - name: "IMAGE"
+          value: 'apache/spark:3.5.1-scala2.12-java17-python3-r-ubuntu'
+  steps:
+    - name: install-spark-application
+      try:
+        - apply:
+            bindings:
+              - name: V_SPARK_VERSION
+                value: (concat('v', replace_all(($SPARK_VERSION), '.', '_')))
+              - name: SPARK_APPLICATION_NAME
+                value: (join('-', ['sparkr', replace_all(($SPARK_VERSION), '.', '-')]))
+            file: sparkr-example.yaml
+        - sleep:
+            duration: 10s
+    - name: verify-common-created-resources
+      bindings:
+        - name: SPARK_DRIVER_POD_NAME
+          value: (join('-', ['sparkr', replace_all(($SPARK_VERSION), '.', '-'),'0-driver']))
+        - name: SPARK_EXECUTOR_POD_NAME
+          value: (join('-', ['sparkr', replace_all(($SPARK_VERSION), '.', '-'),'0-executor']))
+        - name: SPARK_DRIVER_CONFIG_MAP_NAME
+          value: (join('-', ['sparkr', replace_all(($SPARK_VERSION), '.', '-'),'0-spark-drv-conf-map']))
+      try:
+        - assert:
+            file: "../assertions/*.yaml"

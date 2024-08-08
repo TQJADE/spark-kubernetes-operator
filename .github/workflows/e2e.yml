@@ -1,0 +1,61 @@
+name: Spark Operator E2E Test Suites
+run-name: ${{ github.actor }} is testing out Spark Operator E2E Suites
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  e2e-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        test_group:
+          - spark-versions
+          - python
+          - R
+    steps:
+      - name: setup-minikube
+        uses: medyagh/setup-minikube@v0.0.18
+        with:
+          cache: true
+        id: install-minikube
+      - name: set-up-helm
+        uses: azure/setup-helm@v4.2.0
+        with:
+          version: latest
+          cache: true
+        id: install-helm
+      - name: setup-chainsaw
+        uses: kyverno/action-install-chainsaw@v0.2.7
+        with:
+          cache: true
+        id: install-chainsaw
+      - name: install-spark-operator
+        run: |
+          kubectl get pods -A
+          chainsaw version
+          helm version
+          # Block by https://issues.apache.org/jira/browse/SPARK-48398 
+          # Add Helm chart for Operator Deployment
+          # helm install spark-kubernetes-operator -f \n
+          # build-tools/helm/spark-kubernetes-operator/values.yaml \n
+          # build-tools/helm/spark-kubernetes-operator/
+      - name: run-e2e-test
+        run: |
+          chainsaw test --test-dir ./tests/e2e/${{ matrix.test_group }} --parallel 2
+
+  e2e-tests-check:
+    runs-on: ubuntu-latest
+    needs: [e2e-tests]
+    steps:
+      - name: Print result
+        run: echo ${{ needs.e2e-tests.result }}

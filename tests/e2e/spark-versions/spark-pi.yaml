@@ -1,0 +1,16 @@
+apiVersion: org.apache.spark/v1alpha1
+kind: SparkApplication
+metadata:
+  name: ($SPARK_APPLICATION_NAME)
+  namespace: default
+spec:
+  mainClass: "org.apache.spark.examples.SparkPi"
+  jars: ($JARS)
+  sparkConf:
+    spark.executor.instances: "1"
+    # see also https://hub.docker.com/_/spark
+    spark.kubernetes.container.image: ($IMAGE)
+    spark.kubernetes.authenticate.driver.serviceAccountName: "spark"
+  runtimeVersions:
+    sparkVersion: ($V_SPARK_VERSION)
+    javaVersion: ($V_JAVA_VERSION)
