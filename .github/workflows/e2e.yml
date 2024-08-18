@@ -43,6 +43,7 @@ jobs:
           kubectl version
           chainsaw version
           helm version
+          ls -la
           docker build --build-arg APP_VERSION=0.1.0 -t spark-kubernetes-operator:0.1.0 -f build-tools/docker/Dockerfile .
           ./gradlew spark-operator-api:relocateGeneratedCRD
           helm install spark-kubernetes-operator --create-namespace -f build-tools/helm/spark-kubernetes-operator/values.yaml build-tools/helm/spark-kubernetes-operator/
