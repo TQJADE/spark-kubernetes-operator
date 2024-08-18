@@ -40,7 +40,7 @@ jobs:
         id: install-chainsaw
       - name: install-spark-operator
         run: |
-          kubectl get pods -A
+          kubectl version
           chainsaw version
           helm version
           docker build --build-arg APP_VERSION=0.1.0 -t spark-kubernetes-operator:0.1.0 -f build-tools/docker/Dockerfile .
