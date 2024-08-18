@@ -21,7 +21,6 @@ jobs:
         test_group:
           - spark-versions
           - python
-          - R
     steps:
       - name: setup-minikube
         uses: medyagh/setup-minikube@v0.0.18
@@ -45,6 +44,7 @@ jobs:
           chainsaw version
           helm version
           docker build --build-arg APP_VERSION=0.1.0 -t spark-kubernetes-operator:0.1.0 -f build-tools/docker/Dockerfile .
+          ./gradlew spark-operator-api:relocateGeneratedCRD
           helm install spark-kubernetes-operator --create-namespace -f build-tools/helm/spark-kubernetes-operator/values.yaml build-tools/helm/spark-kubernetes-operator/
       - name: run-e2e-test
         run: |
