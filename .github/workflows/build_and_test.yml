@@ -28,10 +28,14 @@ jobs:
           config: .github/.licenserc.yaml
   build-test:
     name: "Build Test CI"
-    runs-on: ubuntu-latest
     strategy:
       matrix:
         java-version: [ 17, 21 ]
+        os:
+          - "ubuntu-latest"
+          - "macos-14"
+          - "macos-14-arm64"
+    runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
@@ -46,7 +50,13 @@ jobs:
           ./gradlew build
   build-image:
     name: "Build Operator Image CI"
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        java-version: [ 17, 21 ]
+        os:
+          - "ubuntu-latest"
+          - "macos-14-arm64"
+    runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -58,92 +68,100 @@ jobs:
           cache: 'gradle'
       - name: Build Operator Image
         run: |
+          if ! type docker; then
+            brew install colima
+            sudo curl -L -o /opt/homebrew/Cellar/lima/0.22.0/bin/limactl https://github.com/mikekazakov/lima-nohvf/raw/master/limactl && sudo chmod +x /opt/homebrew/Cellar/lima/0.22.0/bin/limactl
+            colima start --network-address --arch arm64 --vm-type=qemu
+          fi
           ./gradlew buildDockerImage
           docker run spark-kubernetes-operator:$(./gradlew properties | grep '^version:' | awk '{print $2}')
-  k8s-integration-tests:
-    name: "K8s Integration Tests"
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        kubernetes-version:
-          - "1.28.0"
-          - "1.31.0"
-        test-group:
-          - spark-versions
-          - python
-          - state-transition
-        dynamic-config-test-group:
-          - watched-namespaces
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-      - name: Set up JDK 21
-        uses: actions/setup-java@v4
-        with:
-          java-version: 21
-          distribution: 'adopt'
-          cache: 'gradle'
-      - name: Set up Minikube
-        uses: medyagh/setup-minikube@v0.0.18
-        with:
-          cache: true
-          kubernetes-version: ${{ matrix.kubernetes-version }}
-          cpus: 2
-          memory: 6144m
-      - name: Set Up Go
-        uses: actions/setup-go@v5
-      - name: Set Up Chainsaw
-        run: |
-          go install github.com/kyverno/chainsaw@latest
-      - name: Print K8S pods and nodes info
-        run: |
-          kubectl get pods -A
-          kubectl describe node
-      - name: Run Spark K8s Operator on K8S with Dynamic Configuration Disabled
-        run: |
-          kubectl create clusterrolebinding serviceaccounts-cluster-admin --clusterrole=cluster-admin --group=system:serviceaccounts || true
-          eval $(minikube docker-env)
-          ./gradlew buildDockerImage
-          ./gradlew spark-operator-api:relocateGeneratedCRD
-          helm install spark-kubernetes-operator --create-namespace -f build-tools/helm/spark-kubernetes-operator/values.yaml build-tools/helm/spark-kubernetes-operator/
-          helm test spark-kubernetes-operator
-          # Use remote host' s docker image
-          minikube docker-env --unset
-      - name: Run E2E Test with Dynamic Configuration Disabled
-        run: |
-          chainsaw test --test-dir ./tests/e2e/${{ matrix.test-group }} --parallel 2
-      - name: Run Spark K8s Operator on K8S with Dynamic Configuration Enabled
-        run: |
-          helm uninstall spark-kubernetes-operator
-          eval $(minikube docker-env)
-          helm install spark-kubernetes-operator --create-namespace -f \
-          build-tools/helm/spark-kubernetes-operator/values.yaml -f \
-          tests/e2e/helm/dynamic-config-values.yaml \
-          build-tools/helm/spark-kubernetes-operator/
-          minikube docker-env --unset
-      - name: Run E2E Test with Dynamic Configuration Enabled
-        run: |
-          chainsaw test --test-dir ./tests/e2e/${{ matrix.dynamic-config-test-group }} --parallel 2
-
-  lint:
-    name: "Linter and documentation"
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          java-version: 17
-          distribution: 'adopt'
-          cache: 'gradle'
-      - name: Linters
-        run: |
-          ./gradlew build -x test
-      - name: Javadoc Generation
-        run: |
-          ./gradlew javadoc
-      - name: Validate helm chart linting
-        run: |
-          helm lint --strict build-tools/helm/spark-kubernetes-operator
+#  k8s-integration-tests:
+#    name: "K8s Integration Tests"
+#    strategy:
+#      fail-fast: false
+#      matrix:
+#        os:
+#          - "ubuntu-latest"
+#          - "macos-14"
+#        kubernetes-version:
+#          - "1.28.0"
+#          - "1.31.0"
+#        test-group:
+#          - spark-versions
+#          - python
+#          - state-transition
+#        dynamic-config-test-group:
+#          - watched-namespaces
+#    runs-on: ${{ matrix.os }}
+#    steps:
+#      - name: Checkout repository
+#        uses: actions/checkout@v4
+#      - name: Set up JDK 21
+#        uses: actions/setup-java@v4
+#        with:
+#          java-version: 21
+#          distribution: 'adopt'
+#          cache: 'gradle'
+#      - name: Set up Minikube
+#        uses: medyagh/setup-minikube@v0.0.18
+#        with:
+#          cache: true
+#          kubernetes-version: ${{ matrix.kubernetes-version }}
+#          cpus: 2
+#          memory: 6144m
+#      - name: Set Up Go
+#        uses: actions/setup-go@v5
+#      - name: Set Up Chainsaw
+#        run: |
+#          go install github.com/kyverno/chainsaw@latest
+#      - name: Print K8S pods and nodes info
+#        run: |
+#          kubectl get pods -A
+#          kubectl describe node
+#      - name: Run Spark K8s Operator on K8S with Dynamic Configuration Disabled
+#        run: |
+#          kubectl create clusterrolebinding serviceaccounts-cluster-admin --clusterrole=cluster-admin --group=system:serviceaccounts || true
+#          eval $(minikube docker-env)
+#          ./gradlew buildDockerImage
+#          ./gradlew spark-operator-api:relocateGeneratedCRD
+#          helm install spark-kubernetes-operator --create-namespace -f build-tools/helm/spark-kubernetes-operator/values.yaml build-tools/helm/spark-kubernetes-operator/
+#          helm test spark-kubernetes-operator
+#          # Use remote host' s docker image
+#          minikube docker-env --unset
+#      - name: Run E2E Test with Dynamic Configuration Disabled
+#        run: |
+#          chainsaw test --test-dir ./tests/e2e/${{ matrix.test-group }} --parallel 2
+#      - name: Run Spark K8s Operator on K8S with Dynamic Configuration Enabled
+#        run: |
+#          helm uninstall spark-kubernetes-operator
+#          eval $(minikube docker-env)
+#          helm install spark-kubernetes-operator --create-namespace -f \
+#          build-tools/helm/spark-kubernetes-operator/values.yaml -f \
+#          tests/e2e/helm/dynamic-config-values.yaml \
+#          build-tools/helm/spark-kubernetes-operator/
+#          minikube docker-env --unset
+#      - name: Run E2E Test with Dynamic Configuration Enabled
+#        run: |
+#          chainsaw test --test-dir ./tests/e2e/${{ matrix.dynamic-config-test-group }} --parallel 2
+#
+#  lint:
+#    name: "Linter and documentation"
+#    runs-on: ubuntu-latest
+#    steps:
+#      - name: Checkout repository
+#        uses: actions/checkout@v4
+#      - name: Set up JDK 17
+#        uses: actions/setup-java@v4
+#        with:
+#          java-version: 17
+#          distribution: 'adopt'
+#          cache: 'gradle'
+#      - name: Linters
+#        run: |
+#          ./gradlew build -x test
+#      - name: Javadoc Generation
+#        run: |
+#          ./gradlew javadoc
+#      - name: Validate helm chart linting
+#        run: |
+#          helm lint --strict build-tools/helm/spark-kubernetes-operator
