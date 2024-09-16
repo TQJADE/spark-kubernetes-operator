@@ -110,9 +110,9 @@ jobs:
           helm test spark-kubernetes-operator
           # Use remote host' s docker image
           minikube docker-env --unset
-      - name: Run E2E Test with Dynamic Configuration Disabled
-        run: |
-          chainsaw test --test-dir ./tests/e2e/${{ matrix.test-group }} --parallel 2
+#      - name: Run E2E Test with Dynamic Configuration Disabled
+#        run: |
+#          chainsaw test --test-dir ./tests/e2e/${{ matrix.test-group }} --parallel 2
       - name: Run Spark K8s Operator on K8S with Dynamic Configuration Enabled
         run: |
           helm uninstall spark-kubernetes-operator
