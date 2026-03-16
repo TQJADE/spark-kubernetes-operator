@@ -61,7 +61,8 @@ tasks.register('generateCrds') {
         .withFilesToScan(filesToScan)
 
     def crdGenerator = new io.fabric8.crdv2.generator.CRDGenerator()
-        .customResourceClasses(collector.findCustomResourceClasses())
+            .withMinQuotes(true)
+            .customResourceClasses(collector.findCustomResourceClasses())
         .inOutputDir(outputDir)
 
     def crdGenerationInfo = crdGenerator.detailedGenerate()
