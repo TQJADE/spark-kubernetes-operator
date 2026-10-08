@@ -23,12 +23,12 @@ under the License.
 
 Spark Operator supports different ways to configure the behavior:
 
-* **spark-operator.properties** provided when deploying the operator. In addition to the
-  [property file](../build-tools/helm/spark-kubernetes-operator/conf/spark-operator.properties),
-  it is also possible to override or append config properties in helm
+* **spark-operator.properties** provided when deploying the operator. It is possible to override
+  the [default values](./config_properties.md) of config properties in helm
   [Values files](../build-tools/helm/spark-kubernetes-operator/values.yaml).
 * **System Properties** : when provided as system properties (e.g. via -D options to the
-  operator JVM), it overrides the values provided in property file.
+  operator JVM), they apply only to the properties which are not provided in the property file,
+  i.e. the values in the property file take precedence over system properties.
 * **Hot property loading** : when enabled, a
   [configmap](https://kubernetes.io/docs/concepts/configuration/configmap/) would be created with
   the operator in the same namespace. Operator can monitor updates performed on the configmap. Hot
@@ -39,6 +39,10 @@ Spark Operator supports different ways to configure the behavior:
       rebooting it.
   * Please be advised that not all properties can be hot-loaded and honored at runtime.
       Refer the list of [supported properties](./config_properties.md) for more details.
+
+A Boolean property accepts `true` or `false` in any case, ignoring surrounding whitespace. If a
+property has an invalid value, e.g. `yes` for a Boolean property or `null`, operator ignores it and
+uses the default value instead, logging a warning once for each invalid value.
 
 To enable hot properties loading, update the **helm chart values file** with
 
@@ -53,9 +57,11 @@ operatorConfiguration:
 
 ## Kubernetes Events
 
-When `spark.kubernetes.operator.events.enabled` is `true`, the operator publishes Kubernetes
-`Event` objects about `SparkApplication` and `SparkCluster` resources into their namespaces. They
-are visible via `kubectl describe` and `kubectl get events`.
+By default, the operator publishes Kubernetes `Event` objects about `SparkApplication` and
+`SparkCluster` resources into their namespaces. They are visible via `kubectl describe` and
+`kubectl get events`. To publish none, set `spark.kubernetes.operator.events.enabled` to `false`.
+This option supports dynamic override. To skip only some reasons, use
+`spark.kubernetes.operator.events.excludedReasons` instead, as described below.
 
 Publishing them requires the `get`, `create` and `patch` permissions on `events` in the core API
 group in each namespace of the Spark resources. Without them, the operator logs a
@@ -80,7 +86,9 @@ kubectl get events -A --field-selector reportingComponent=spark-kubernetes-opera
 ```
 
 Whenever a resource transitions into a new state, the operator publishes an event whose `reason`
-is the name of the new state and whose `message` is the state message. Repeated transitions into
+is the name of the new state and whose `message` is the state message, except that the event of
+`SchedulingFailure` leaves out the stack trace of the failure, see
+[Event messages](#event-messages). Repeated transitions into
 the same state are aggregated into a single `Event` object by incrementing its `count` and
 replacing its `message`. A repeat carrying the same `message` may be paced by
 [`minIntervalSeconds`](#event-frequency), while one carrying a new `message` is always published.
@@ -92,24 +100,24 @@ replacing its `message`. A repeat carrying the same `message` may be paced by
 | `Normal` | All other states, e.g. `ScheduledToRestart`, `DriverRequested`, `DriverStarted`, `DriverReady`, `InitializedBelowThresholdExecutors`, `RunningHealthy`, `RunningWithPartialCapacity`, `Succeeded`, `ResourceReleased` and `Suspended` |
 
 The initial `Submitted` status of a new resource is not persisted to the API server on its own, so
-no event is published for it. A `Submitted` event is published only when a `SparkCluster` moves
-from `Suspended` back to `Submitted`, after `spec.suspend` is set back to `false` or after its
-eviction by Kueue.
+no event is published for it. A `Submitted` event is published only when a `SparkApplication` or a
+`SparkCluster` moves from `Suspended` back to `Submitted`, after `spec.suspend` is set back to
+`false`, or after its eviction by Kueue.
 
 In addition, the operator publishes the following `Warning` events.
 
 | Reason | When |
 |---|---|
-| `ReconcileError` | A reconciliation throws. Only the first attempt of a failure episode publishes. |
+| `ReconcileError` | A reconciliation throws. It is republished on every retry while the failure lasts, subject to [`minIntervalSeconds`](#event-frequency). |
 | `CleanupError` | A cleanup throws, so the resource cannot finish deleting. |
 | `StatusUpdateFailed` | A status patch is rejected. Transport-level errors are skipped. |
 | `KueueAdmissionRequestFailed` | Creating, reading or deleting a stale Kueue `Workload` fails, or the driver or master cannot be read before the admission is requested. Transport-level errors are skipped and retried every 5 seconds, while a persistent failure is retried with the default interval. |
 | `ClusterRequestFailed` | Applying the Services, StatefulSets, NetworkPolicy, HorizontalPodAutoscaler or PodDisruptionBudget of a `SparkCluster` fails in a way which may yet succeed, such as a throttled request or an internal server error from an admission webhook, so it is retried with the default interval instead of failing the cluster. Transport-level errors are skipped. |
-| `SuspendReleaseFailed` | Deleting the master and worker StatefulSets, the HorizontalPodAutoscaler or PodDisruptionBudget of the workers, or the Kueue `Workload` of a `SparkCluster` suspended while running fails, or its pods cannot be listed. A failure which may clear on its own, such as a timeout, is skipped. Every failure is retried with the default interval. |
+| `SuspendReleaseFailed` | Deleting the driver pod (`SparkApplication`), the master and worker StatefulSets or the HorizontalPodAutoscaler or PodDisruptionBudget of the workers (`SparkCluster`), or the Kueue `Workload` of a resource suspended while running fails, or its pods cannot be listed. A failure which may clear on its own, such as a timeout, is skipped. Every failure is retried with the default interval. |
+| `SuspendCheckFailed` | The driver of a suspended `SparkApplication`, or the master of a suspended `SparkCluster` which has not started yet, cannot be read to check whether it was requested, so the resource is neither held, which would release its Kueue `Workload`, nor started. Transport-level errors and throttled requests are skipped. Every such failure is retried with the default interval. While the failure lasts, it is republished on every reconciliation, subject to [`minIntervalSeconds`](#event-frequency). Once the check succeeds again, the next `SuspendHeld` event is published even within that interval, so that it supersedes this one. |
 | `KueueResourceFlavorReadFailed` | Reading the `ResourceFlavor`s which Kueue assigned to an admitted `Workload` fails, so the node selector and the tolerations of the flavors cannot be applied. Transport-level errors are skipped and retried every 5 seconds, while a persistent failure is retried with the default interval. |
-| `KueuePodsReadyUpdateFailed` | Recording the `PodsReady` condition on the Kueue `Workload` of a running `SparkApplication` or `SparkCluster` fails, e.g. without the permission for the `workloads/status` subresource, so Kueue may evict it by a `PodsReadyTimeout`. Transport-level errors and conflicts are skipped. A `SparkCluster` retries them every 5 seconds and a persistent failure with the default interval, while a `SparkApplication` retries any failure with its next reconciliation, so that the recording does not hold back the observation of its driver. See [Kueue](spark_custom_resources.md#kueue). |
+| `KueuePodsReadyUpdateFailed` | Recording the `PodsReady` condition on the Kueue `Workload` of a running `SparkApplication` or `SparkCluster` fails, e.g. without the permission for the `workloads/status` subresource, so Kueue may evict it by a `PodsReadyTimeout`, which releases it and queues it again, a `SparkApplication` with a new attempt, even if its pods are ready. Transport-level errors and conflicts are skipped. A `SparkCluster` retries them every 5 seconds and a persistent failure with the default interval, while a `SparkApplication` retries any failure with its next reconciliation, so that the recording does not hold back the observation of its driver. See [Kueue](spark_custom_resources.md#kueue). |
 | `KueueDisabled` | A `SparkApplication` or `SparkCluster` labeled with `kueue.x-k8s.io/queue-name` is not queued, since `spark.kubernetes.operator.kueue.enabled` is disabled, so the driver (or master and worker) is requested without the Kueue admission. |
-| `KueueEvictionIgnored` | Kueue evicted or deactivated the `Workload` of a `SparkApplication` whose driver is requested and whose attempt has not stopped, or evicted the `Workload` of a running `SparkCluster` by a `PodsReadyTimeout`. The operator does not act on it, so the driver and executors (or master and workers) keep running. An evicted `Workload` keeps holding its quota, while a deactivated one no longer counts against it. It is republished on every reconciliation while it lasts, subject to [`minIntervalSeconds`](#event-frequency). See [Kueue](spark_custom_resources.md#kueue). |
 
 For a resource held by [`spec.suspend`](spark_custom_resources.md#suspend) or queued by
 [Kueue](spark_custom_resources.md#kueue), the operator also publishes the following `Normal`
@@ -159,9 +167,11 @@ as a failure is never delayed. Only a repeat that says exactly what the last one
 such a repeat merely bumps the `count` of the one `Event` object, yet still costs a read and a
 write on the API server. A repeat whose `message` differs is always published, because the
 operator rewrites the `message` of the existing `Event`, so the current cause of a failure and the
-`SuspendHeld` message that retracts a stale `KueueAdmissionPending` keep reaching the user. The
-resource is identified by its `metadata.uid`, so a resource that reuses the name of a deleted one
-starts over.
+`SuspendHeld` message that retracts a stale `KueueAdmissionPending` keep reaching the user.
+Likewise, a `Normal` event which repeats after a `Warning` event on the same resource is published,
+since it says that the warning no longer applies, e.g. `SuspendHeld` once the check which
+`SuspendCheckFailed` reported succeeds again. The resource is identified by its `metadata.uid`, so
+a resource that reuses the name of a deleted one starts over.
 
 An event is only published when a reconciliation emits it, so the effective period is this
 interval **rounded up to the next repeat**, not the interval itself. With the defaults,
@@ -181,7 +191,36 @@ visible.
 
 The interval is held from the moment an event is handed to the event sink, not from the moment it
 reaches the API server. The operator logs and swallows event write failures rather than failing
-the reconciliation, so a write that failed still holds the interval; the next repeat recovers it.
+the reconciliation, and its Kubernetes client does not retry an event write, e.g. one that the API
+server throttles (`429`) or fails (`5xx`), since the reconciliation waits for the write. So a
+write that failed is dropped, right away when the API server answers with an error or refuses the
+connection, or after the request timeout (10 seconds by default) when it does not answer, yet
+still holds the interval. An event which is republished, such as `SuspendHeld` or a warning about
+a failure which lasts, recovers with its next repeat after the interval, while one which is not,
+such as a state transition, is lost; the resource status remains the source of truth.
+
+### Event messages
+
+The `message` of a `Warning` event about an error, such as `ReconcileError` or
+`ClusterRequestFailed`, describes the exception and its innermost cause, without the stack trace,
+which the operator logs. For a request which the API server rejected, it is the message of the API
+server, as in the events of the built-in controllers, e.g. an RBAC denial which names the
+ServiceAccount of the operator, a rejection by an admission webhook or a resource quota, or a field
+value which the API server found invalid. When `SchedulingFailure` is caused by an exception, its
+event describes the exception alike, while its state message keeps the stack trace.
+
+Events reach more readers than the status of the resources. The built-in `view`, `edit` and
+`admin` ClusterRoles grant reading the `events` of a namespace, but not the `SparkApplication` and
+`SparkCluster` resources, which the Helm chart does not aggregate into them, and event exporters
+often forward warnings out of the cluster, e.g. to chat or logging services. So keep credentials
+out of `spec.sparkConf` and pod templates, since an error may quote them, e.g. as an invalid value,
+and refer to Kubernetes Secrets instead, e.g. with `spark.kubernetes.driver.secretKeyRef.[EnvName]`
+and `spark.kubernetes.executor.secretKeyRef.[EnvName]`. To keep the details of failures in the
+resource status and the operator log only, exclude their reasons, e.g. as follows.
+
+```properties
+spark.kubernetes.operator.events.excludedReasons=SchedulingFailure,ReconcileError,CleanupError,StatusUpdateFailed,ClusterRequestFailed,SuspendCheckFailed,SuspendReleaseFailed,Kueue.*Failed
+```
 
 ## Metrics
 
@@ -222,6 +261,11 @@ via [Codahale JVM Metrics](https://javadoc.io/doc/com.codahale.metrics/metrics-j
 | kubernetes.client.http.response.5xx                       | Meter      | Tracking the rates of HTTP Code 5xx responses (server error) received from the Kubernetes API Server per response code.  |
 | kubernetes.client.`ResourceName`.`Method`                 | Meter      | Tracking the rates of HTTP request for a combination of one Kubernetes resource and one http method                      |
 | kubernetes.client.`NamespaceName`.`ResourceName`.`Method` | Meter      | Tracking the rates of HTTP request for a combination of one namespace-scoped Kubernetes resource and one http method     |
+
+A request which gets no response is counted in `kubernetes.client.failed` while the client still
+has a retry left for it, even if it does not retry it, e.g. on a request timeout. So a request of
+a client which never retries, i.e. a Kubernetes event write or the recording of the Kueue
+`PodsReady` condition, is not counted there when it gets no response.
 
 ### Latency for State Transition
 

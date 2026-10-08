@@ -7,7 +7,7 @@ permissions:
   contents: read
 
 env:
-  KUEUE_VERSION: v0.19.4
+  KUEUE_VERSION: v0.20.0
   CHAINSAW_VERSION: v0.2.15
 
 jobs:
@@ -46,12 +46,12 @@ jobs:
         uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb
         with:
           cache-provider: basic
-      - name: Build with Gradle
+      - name: Run unit tests
         run: |
           if [[ "${{ matrix.java-version }}" == "25" || "${{ matrix.java-version }}" == "26" ]]; then
             export JDK_JAVA_OPTIONS="-XX:+UseCompactObjectHeaders"
           fi
-          ./gradlew build
+          ./gradlew test -PtestJavaVersion=${{ matrix.java-version }}
   build-image:
     name: "Build Operator Image CI"
     runs-on: ubuntu-26.04
@@ -59,18 +59,12 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
-      - name: Set up JDK 26
-        uses: actions/setup-java@v6
-        with:
-          java-version: 26
-          distribution: 'zulu'
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb
-        with:
-          cache-provider: basic
       - name: Build Operator Image
         run: |
-          ./gradlew buildDockerImage
+          # Same as `./gradlew buildDockerImage` without starting Gradle on the host
+          VERSION=$(sed -n 's/^  version = "\(.*\)"$/\1/p' build.gradle)
+          test -n "$VERSION"
+          docker build --build-arg APP_VERSION="$VERSION" -t "apache/spark-kubernetes-operator:$VERSION" -f build-tools/docker/Dockerfile .
       - name: Save Operator Image
         run: |
           docker save apache/spark-kubernetes-operator | zstd -T0 -o spark-kubernetes-operator.tar.zst
@@ -167,6 +161,9 @@ jobs:
           - kubernetes-version: "1.37.0"
             mode: kueue
             test-group: kueue
+          - kubernetes-version: "1.37.0"
+            mode: kueue
+            test-group: kueue-pods-ready
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -204,12 +201,13 @@ jobs:
         if: matrix.mode == 'kueue'
         run: |
           kubectl apply --server-side -f https://github.com/kubernetes-sigs/kueue/releases/download/${{ env.KUEUE_VERSION }}/manifests.yaml
-          # Kueue enables waitForPodsReady by default with a 30 minute timeout. Shorten it, so that a
-          # Workload whose pods are not ready is evicted within the test. A Kueue version which sets
-          # it already fails here, rather than with a duplicate key which Kueue rejects on start.
+          # Kueue enables waitForPodsReady by default with a 30 minute timeout and a 60 second
+          # requeue backoff. Shorten them, so that a Workload whose pods are not ready is evicted
+          # within the test and queued again sooner. A Kueue version which sets waitForPodsReady
+          # already fails here, rather than with a duplicate key which Kueue rejects on start.
           set -o pipefail
           kubectl get configmap kueue-manager-config -n kueue-system -o json \
-            | jq '.data["controller_manager_config.yaml"] |= if ("\n" + .) | contains("\nwaitForPodsReady:") then error("waitForPodsReady is configured already") else . + "\nwaitForPodsReady:\n  timeout: 2m\n" end' \
+            | jq '.data["controller_manager_config.yaml"] |= if ("\n" + .) | contains("\nwaitForPodsReady:") then error("waitForPodsReady is configured already") else . + "\nwaitForPodsReady:\n  timeout: 2m\n  requeuingStrategy:\n    backoffBaseSeconds: 10\n" end' \
             | kubectl replace -f -
           kubectl rollout restart deploy/kueue-controller-manager -n kueue-system
           # Kueue installs webhooks for pods, deployments and statefulsets with failurePolicy=Fail,

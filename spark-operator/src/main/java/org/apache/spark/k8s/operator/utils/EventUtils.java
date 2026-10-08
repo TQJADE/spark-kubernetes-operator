@@ -21,6 +21,7 @@ package org.apache.spark.k8s.operator.utils;
 
 import java.util.Set;
 
+import io.fabric8.kubernetes.client.KubernetesClientException;
 import io.javaoperatorsdk.operator.api.event.EventRecord;
 import io.javaoperatorsdk.operator.api.event.EventType;
 import io.javaoperatorsdk.operator.api.event.ResourceEventRecorder;
@@ -67,10 +68,16 @@ public final class EventUtils {
   public static final String REASON_SUSPEND_HELD = "SuspendHeld";
 
   /**
-   * Reason for an event describing a failure to release the resources of a SparkCluster which is
-   * suspended while running.
+   * Reason for an event describing a failure to release the resources of a SparkApplication or a
+   * SparkCluster which is suspended while running.
    */
   public static final String REASON_SUSPEND_RELEASE_FAILED = "SuspendReleaseFailed";
+
+  /**
+   * Reason for an event describing a failure to check whether the driver or master of a resource
+   * suspended by {@code spec.suspend} was requested, which is retried.
+   */
+  public static final String REASON_SUSPEND_CHECK_FAILED = "SuspendCheckFailed";
 
   /** Reason for an event describing that a resource waits for Kueue to admit its Workload. */
   public static final String REASON_KUEUE_ADMISSION_PENDING = "KueueAdmissionPending";
@@ -96,12 +103,6 @@ public final class EventUtils {
    * since the Kueue integration is disabled.
    */
   public static final String REASON_KUEUE_DISABLED = "KueueDisabled";
-
-  /**
-   * Reason for an event describing that Kueue evicted or deactivated the Workload of a running
-   * resource in a way which the operator does not act on, so the resource keeps running.
-   */
-  public static final String REASON_KUEUE_EVICTION_IGNORED = "KueueEvictionIgnored";
 
   /** Maximum number of characters an event message may have, including the ellipsis. */
   static final int MAX_MESSAGE_LENGTH = 1024;
@@ -146,8 +147,8 @@ public final class EventUtils {
    * <p>The reason doubles as the event key, so repeated warnings for the same reason on the same
    * resource collapse into a count increment on a single Event object instead of creating one
    * Event per occurrence. Messages therefore must not be part of the identity: they typically vary
-   * between attempts, for instance because a {@code KubernetesClientException} message embeds the
-   * request URL.
+   * between attempts, for instance because a rejection by a resource quota reports its current
+   * usage.
    *
    * @param recorder The event recorder bound to the resource.
    * @param reason A short CamelCase reason, as expected by Kubernetes.
@@ -193,8 +194,14 @@ public final class EventUtils {
   /**
    * Builds a concise single-line description of an exception, suitable for an event message. The
    * innermost cause is appended when the exception has one, since that is usually where the
-   * actionable detail is. The full stack trace is intentionally omitted, it belongs in the
-   * operator log.
+   * actionable detail is, unless its message is the same. The full stack trace is intentionally
+   * omitted, it belongs in the operator log.
+   *
+   * <p>A request which the API server answered with an error is described by the message of the
+   * returned {@code Status}, like the events of the built-in controllers, rather than by the
+   * message of fabric8, which wraps it with the request URL and a dump of the whole {@code
+   * Status}. fabric8 rethrows such a failure as a copy of itself which carries the original as its
+   * cause, so that cause is not repeated.
    *
    * @param throwable The exception to describe, may be null.
    * @return A description of the exception.
@@ -203,16 +210,31 @@ public final class EventUtils {
     if (throwable == null) {
       return "";
     }
-    StringBuilder builder = new StringBuilder(describeSingle(throwable));
+    String message = messageOf(throwable);
+    String description = describeSingle(throwable, message);
     Throwable rootCause = rootCauseOf(throwable);
-    if (rootCause != null) {
-      builder.append(", caused by: ").append(describeSingle(rootCause));
+    if (rootCause == null) {
+      return description;
     }
-    return builder.toString();
+    String rootCauseMessage = messageOf(rootCause);
+    // A cause with the same message adds nothing but its type, e.g. the original of the copy which
+    // fabric8 rethrows, or the request timeout which it wraps.
+    if (StringUtils.isNotBlank(message) && message.equals(rootCauseMessage)) {
+      return description;
+    }
+    return description + ", caused by: " + describeSingle(rootCause, rootCauseMessage);
   }
 
-  private static String describeSingle(Throwable throwable) {
-    String message = throwable.getMessage();
+  private static String messageOf(Throwable throwable) {
+    if (throwable instanceof KubernetesClientException e
+        && e.getStatus() != null
+        && StringUtils.isNotBlank(e.getStatus().getMessage())) {
+      return e.getStatus().getMessage();
+    }
+    return throwable.getMessage();
+  }
+
+  private static String describeSingle(Throwable throwable, String message) {
     String type = throwable.getClass().getSimpleName();
     return StringUtils.isBlank(message) ? type : type + ": " + message;
   }

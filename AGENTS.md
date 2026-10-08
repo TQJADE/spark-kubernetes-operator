@@ -40,7 +40,7 @@ there, never inline in a module.
 **Requirements**
 
 - **JDK 21 or newer** — the Gradle toolchain auto-provisions JDK 27 and targets Java 21 bytecode;
-  CI builds on Java 21 / 25 / 26 / 27.
+  CI runs unit tests on Java 21 / 25 / 26 / 27.
 - **Docker** — required for `./gradlew buildDockerImage`.
 - **Kubernetes cluster** (e.g. minikube), **Helm 3**, and **kubectl** — to deploy and run the
   operator.
@@ -61,8 +61,8 @@ Gradle multi-project build (see [settings.gradle](settings.gradle)); root group 
 - `build-tools/docs-utils/` — Gradle subproject (`build-tools-docs-utils`) that generates the
   config and CRD documentation.
 - `tests/e2e/` — [Chainsaw](https://kyverno.github.io/chainsaw/) end-to-end tests, grouped by
-  scenario (e.g. `state-transition`, `python`, `watched-namespaces`); shared assertions live in
-  `tests/e2e/assertions/`.
+  scenario (e.g. `state-transition`, `python`, `watched-namespaces`); shared assertions and
+  fixtures live in `tests/e2e/assertions/` and `tests/e2e/fixtures/`.
 - `build-tools/`, `config/`, `examples/`, `docs/`, `dev/` — packaging (Docker / Helm), linter
   configs, example custom resources, documentation, and developer scripts.
 
@@ -76,6 +76,7 @@ toolchain provisions JDK 27, so a JDK 21+ is required.
 ./gradlew build                  # Full build: compile, linters, and all unit tests
 ./gradlew :spark-operator:test   # Run a single module's tests
 ./gradlew :spark-operator:test --tests "org.apache.spark.k8s.operator.SparkOperatorTest"  # one class
+./gradlew test -PtestJavaVersion=21  # Run unit tests on JDK 21 (compilation still uses JDK 27)
 ./gradlew spotlessApply          # Auto-format sources (run before committing)
 ./gradlew spotlessCheck          # Verify formatting only
 ./gradlew javadoc                # Generate Javadoc (CI gate)
@@ -112,7 +113,8 @@ chainsaw test --test-dir ./tests/e2e/state-transition --parallel 1
 ```
 
 `./gradlew build` runs the full quality gate locally — Checkstyle, PMD, SpotBugs, Spotless, and
-JaCoCo. Run it before pushing; CI runs the same matrix on Java 21 / 25 / 26 / 27 (x86 and arm).
+JaCoCo. Run it before pushing; CI runs the quality gate once and the unit tests on
+Java 21 / 25 / 26 / 27 (x86 and arm) via `-PtestJavaVersion`.
 
 ## Code Style
 
@@ -146,6 +148,10 @@ JaCoCo. Run it before pushing; CI runs the same matrix on Java 21 / 25 / 26 / 27
   (e.g. `[SPARK-57114] Upgrade spotless-plugin-gradle to 8.6.0`).
 - PRs are merged via **squash** or **rebase** — no merge commits (see [.asf.yaml](.asf.yaml)). Keep
   changes surgical and scoped to the ticket.
+- If a change alters a user-visible behavior of the latest release, e.g. a default value, a
+  generated resource, a state transition, an RBAC rule or a Helm value, add an item to
+  [docs/migration_guide.md](docs/migration_guide.md) in the same PR, with how to restore the
+  previous behavior if possible. Changes of unreleased features need no item.
 - Run `./gradlew spotlessApply` and `./gradlew build` before opening a PR.
 - Write PR descriptions in English following
   [.github/PULL_REQUEST_TEMPLATE](.github/PULL_REQUEST_TEMPLATE), and follow the

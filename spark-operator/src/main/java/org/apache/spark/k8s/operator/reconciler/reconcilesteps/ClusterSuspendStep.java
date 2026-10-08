@@ -41,7 +41,6 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.Comparator;
 import java.util.List;
-import java.util.NavigableMap;
 import java.util.Optional;
 import java.util.stream.Collectors;
 
@@ -58,6 +57,7 @@ import org.apache.spark.k8s.operator.kueue.v1beta2.Workload;
 import org.apache.spark.k8s.operator.reconciler.ReconcileProgress;
 import org.apache.spark.k8s.operator.status.ClusterState;
 import org.apache.spark.k8s.operator.status.ClusterStateSummary;
+import org.apache.spark.k8s.operator.status.SuspendReason;
 import org.apache.spark.k8s.operator.utils.EventUtils;
 import org.apache.spark.k8s.operator.utils.ReconcilerUtils;
 import org.apache.spark.k8s.operator.utils.SparkClusterStatusRecorder;
@@ -105,7 +105,8 @@ public final class ClusterSuspendStep extends ClusterReconcileStep {
       return appendStateAndImmediateRequeue(
           context,
           statusRecorder,
-          new ClusterState(ClusterStateSummary.Suspended, CLUSTER_SUSPENDED_MESSAGE));
+          new ClusterState(
+              ClusterStateSummary.Suspended, CLUSTER_SUSPENDED_MESSAGE, SuspendReason.SpecSuspend));
     }
     if (summary == ClusterStateSummary.RunningHealthy) {
       return suspendOnKueueEviction(context, statusRecorder);
@@ -118,13 +119,22 @@ public final class ClusterSuspendStep extends ClusterReconcileStep {
         return appendStateAndImmediateRequeue(
             context,
             statusRecorder,
-            new ClusterState(ClusterStateSummary.Suspended, CLUSTER_SUSPENDED_MESSAGE));
+            new ClusterState(
+                ClusterStateSummary.Suspended,
+                CLUSTER_SUSPENDED_MESSAGE,
+                SuspendReason.SpecSuspend));
       }
       Optional<Duration> keepWorkload = evicted ? keepKueueWorkload(context) : Optional.empty();
       Optional<ReconcileProgress> waiting =
           releaseResources(context, statusRecorder, keepWorkload.isEmpty());
       if (waiting.isPresent()) {
-        return waiting.get();
+        // Pods which are stuck terminating are looked at again only as often as a suspended
+        // cluster otherwise, while the Workload which they no longer hold is released once its
+        // backoff elapses, when nothing else reconciles the cluster
+        return keepWorkload
+            .filter(backoff -> backoff.compareTo(waiting.get().getRequeueAfterDuration()) < 0)
+            .map(ReconcileProgress::completeAndRequeueAfter)
+            .orElse(waiting.get());
       }
       if (keepWorkload.isPresent()) {
         return completeAndRequeueAfter(keepWorkload.get());
@@ -153,12 +163,11 @@ public final class ClusterSuspendStep extends ClusterReconcileStep {
    * Suspends a running cluster whose Kueue Workload is evicted, so that its master and workers and
    * then its Workload are released like on spec.suspend. Kueue keeps the quota of an evicted
    * Workload until then. As spec.suspend is not set, the cluster is queued again once everything is
-   * released, see {@link #keepKueueWorkload} for when that waits. An eviction which {@link
-   * KueueWorkloadUtils#isKeptOnEviction} is only reported, and the cluster keeps running. A cluster
-   * which is not suspended records the `PodsReady` condition on the Workload once the master and
-   * workers are ready, since RunningHealthy does not wait for them, see {@link
-   * KueueWorkloadUtils#recordPodsReady}. That includes a kept eviction: with `blockAdmission`, a
-   * Workload which holds quota without the condition holds back every other workload.
+   * released, see {@link #keepKueueWorkload} for when that waits. Like the built-in Kueue
+   * integrations, which stop the job on any eviction, a `PodsReadyTimeout` suspends the cluster as
+   * well, even if its master and workers are ready by now. A cluster which is not suspended records
+   * the `PodsReady` condition on the Workload once the master and workers are ready, since
+   * RunningHealthy does not wait for them, see {@link KueueWorkloadUtils#recordPodsReady}.
    *
    * @param context The SparkClusterContext for the cluster.
    * @param statusRecorder The SparkClusterStatusRecorder for recording status updates.
@@ -166,55 +175,34 @@ public final class ClusterSuspendStep extends ClusterReconcileStep {
    */
   private ReconcileProgress suspendOnKueueEviction(
       SparkClusterContext context, SparkClusterStatusRecorder statusRecorder) {
-    Optional<Workload> cached = context.getCachedKueueWorkload();
-    Optional<Condition> eviction = cached.flatMap(KueueWorkloadUtils::findEviction);
+    Optional<Condition> eviction =
+        context.getCachedKueueWorkload().flatMap(KueueWorkloadUtils::findEviction);
     if (eviction.isEmpty()) {
       return KueueWorkloadUtils.recordPodsReady(context).orElse(proceed());
     }
-    Workload workload = cached.get();
     String cause = eviction.get().getReason() + ": " + eviction.get().getMessage();
-    if (KueueWorkloadUtils.isKeptOnEviction(workload)) {
-      EventUtils.warn(
-          context.getEventRecorder(),
-          EventUtils.REASON_KUEUE_EVICTION_IGNORED,
-          "Kueue evicted Workload "
-              + workload.getMetadata().getName()
-              + " ("
-              + cause
-              + "), which the operator does not act on, so the master and workers keep running "
-              + "and holding its quota. Set spec.suspend to true or delete the cluster to release "
-              + "them.");
-      return KueueWorkloadUtils.recordPodsReady(context).orElse(proceed());
-    }
     log.info("Kueue evicted the Workload of the cluster ({}), suspending it.", cause);
     return appendStateAndImmediateRequeue(
         context,
         statusRecorder,
-        new ClusterState(ClusterStateSummary.Suspended, CLUSTER_EVICTED_MESSAGE + " " + cause));
+        new ClusterState(
+            ClusterStateSummary.Suspended,
+            CLUSTER_EVICTED_MESSAGE + " " + cause,
+            SuspendReason.KueueEviction));
   }
 
   /**
    * Checks whether the cluster is suspended by the eviction of its Kueue Workload rather than by
-   * spec.suspend. The Suspended state which names its stuck pods, if any, follows the one which
-   * says why it is suspended.
+   * spec.suspend, by the reason of its current Suspended state, which the Suspended state naming
+   * its stuck pods keeps from the one before. A Suspended state without a reason, e.g. one whose
+   * reason the API server pruned for a CRD which does not have it yet, is not taken for an
+   * eviction.
    *
    * @param cluster The suspended SparkCluster.
    * @return True if the cluster was suspended by an eviction and not held by spec.suspend since.
    */
   private static boolean isSuspendedByEviction(SparkCluster cluster) {
-    NavigableMap<Long, ClusterState> history =
-        (NavigableMap<Long, ClusterState>) cluster.getStatus().getStateTransitionHistory();
-    for (ClusterState state : history.descendingMap().values()) {
-      String message = state.getMessage();
-      if (state.getCurrentStateSummary() != ClusterStateSummary.Suspended
-          || CLUSTER_SUSPENDED_MESSAGE.equals(message)) {
-        return false;
-      }
-      if (message != null && message.startsWith(CLUSTER_EVICTED_MESSAGE)) {
-        return true;
-      }
-    }
-    return false;
+    return cluster.getStatus().getCurrentState().getSuspendReason() == SuspendReason.KueueEviction;
   }
 
   /**
@@ -356,7 +344,10 @@ public final class ClusterSuspendStep extends ClusterReconcileStep {
             appendStateAndRequeueAfter(
                 context,
                 statusRecorder,
-                new ClusterState(ClusterStateSummary.Suspended, message),
+                new ClusterState(
+                    ClusterStateSummary.Suspended,
+                    message,
+                    cluster.getStatus().getCurrentState().getSuspendReason()),
                 holdInterval));
       }
     } catch (KubernetesClientException e) {

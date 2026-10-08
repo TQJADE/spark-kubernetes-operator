@@ -26,6 +26,7 @@ under the License.
   - k8s version >= 1.35 is recommended. Operator attempts to be as API compatible as possible, but
       patch support will not be performed on k8s versions that reached EOL.
 - Spark versions 4.0 or above.
+- Kueue version >= 0.20.0 is recommended when the Kueue integration is enabled.
 
 ## Optional Prerequisites
 
@@ -40,7 +41,8 @@ under the License.
 - **Kueue** (`workloads.kueue.x-k8s.io`, `resourceflavors.kueue.x-k8s.io`,
   `workloadpriorityclasses.kueue.x-k8s.io`) — required only when `operatorRbac.kueue.enabled` is
   set. Kueue is not bundled with the operator; install it from
-  [kueue.sigs.k8s.io](https://kueue.sigs.k8s.io/docs/installation/). Kueue's
+  [kueue.sigs.k8s.io](https://kueue.sigs.k8s.io/docs/installation/), and set up its queues, e.g.
+  with [kueue-single-clusterqueue-setup.yaml](../examples/kueue-single-clusterqueue-setup.yaml). Kueue's
   `integrations.externalFrameworks` does not need to list `SparkApplication` or `SparkCluster`:
   the operator manages the `Workload` objects for them, so Kueue does not have to
   recognize the Spark custom resources as job kinds. `operatorRbac.kueue.enabled` also sets
@@ -72,9 +74,10 @@ in `values.yaml`) for the Helm chart.
 To override single parameters you can use `--set`, for example:
 
 ```bash
-helm install --set image.repository=<my_registry>/spark-kubernetes-operator \
+helm install spark \
+   --set image.repository=<my_registry>/spark-kubernetes-operator \
    -f build-tools/helm/spark-kubernetes-operator/values.yaml \
-  build-tools/helm/spark-kubernetes-operator/
+   build-tools/helm/spark-kubernetes-operator/
 ```
 
 You can also provide multiple custom values file by using the `-f` flag, the latest takes
@@ -159,10 +162,9 @@ following table:
 | workloadResources.sparkClusterSentinel.create                    | If enabled, sentinel resources will be created for operator to watch and reconcile for the health probe purpose.                                                               | false                                                                                                   |
 | workloadResources.sparkClusterSentinel.name                      | Name for sentinel resources.                                                                                                                                                   | "spark-cluster-sentinel"                                                                                    |
 | workloadResources.sparkClusterSentinel.sentinelNamespaces.data   | A list of namespaces where sentinel resources will be created in. Note that these namespaces have to be a subset of `workloadResources.namespaces.data`.                       |                                                                                                         |
-| operatorConfiguration.append                                     | If set to true, below conf file & properties would be appended to default conf. Otherwise, they would override default properties.                                             | true                                                                                                    |
 | operatorConfiguration.configMap.annotations                      | Annotations to be applied for the operator configuration config map.                                                                                                           |                                                                                                         |
 | operatorConfiguration.configMap.labels                           | Labels to be applied for the operator configuration config map.                                                                                                                |                                                                                                         |
-| operatorConfiguration.log4j2.properties                          | The default log4j2 configuration.                                                                                                                                              | Refer default [log4j2.properties](../build-tools/helm/spark-kubernetes-operator/conf/log4j2.properties) |
+| operatorConfiguration.log4j2.properties                          | The default log4j2 configuration.                                                                                                                                              | Refer default [values.yaml](../build-tools/helm/spark-kubernetes-operator/values.yaml)                  |
 | operatorConfiguration.spark-operator.properties                  | The default operator configuration.                                                                                                                                            |                                                                                                         |
 | operatorConfiguration.metrics.properties                         | The default operator metrics (sink) configuration.                                                                                                                             |                                                                                                         |
 | operatorConfiguration.dynamicConfig.create                       | If set to true, a config map would be created & watched by operator as source of truth for hot properties loading.                                                             | false                                                                                                   |

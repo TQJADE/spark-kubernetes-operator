@@ -22,7 +22,6 @@ package org.apache.spark.k8s.operator.reconciler;
 import static org.apache.spark.k8s.operator.Constants.LABEL_SPARK_APPLICATION_NAME;
 import static org.apache.spark.k8s.operator.config.SparkOperatorConf.KUEUE_ENABLED;
 import static org.apache.spark.k8s.operator.reconciler.ReconcileProgress.completeAndDefaultRequeue;
-import static org.apache.spark.k8s.operator.utils.ReconcilerUtils.isFirstAttempt;
 import static org.apache.spark.k8s.operator.utils.Utils.basicLabelSecondaryToPrimaryMapper;
 import static org.apache.spark.k8s.operator.utils.Utils.commonResourceLabelsStr;
 
@@ -56,10 +55,10 @@ import org.apache.spark.k8s.operator.reconciler.observers.AppDriverStartObserver
 import org.apache.spark.k8s.operator.reconciler.observers.AppDriverTimeoutObserver;
 import org.apache.spark.k8s.operator.reconciler.reconcilesteps.AppCleanUpStep;
 import org.apache.spark.k8s.operator.reconciler.reconcilesteps.AppInitStep;
-import org.apache.spark.k8s.operator.reconciler.reconcilesteps.AppKueueEvictionStep;
 import org.apache.spark.k8s.operator.reconciler.reconcilesteps.AppReconcileStep;
 import org.apache.spark.k8s.operator.reconciler.reconcilesteps.AppResourceObserveStep;
 import org.apache.spark.k8s.operator.reconciler.reconcilesteps.AppRunningStep;
+import org.apache.spark.k8s.operator.reconciler.reconcilesteps.AppSuspendStep;
 import org.apache.spark.k8s.operator.reconciler.reconcilesteps.AppUnknownStateStep;
 import org.apache.spark.k8s.operator.reconciler.reconcilesteps.AppValidateStep;
 import org.apache.spark.k8s.operator.utils.EventUtils;
@@ -141,15 +140,14 @@ public class SparkAppReconciler implements Reconciler<SparkApplication>, Cleaner
                       retryInfo.isLastAttempt());
                 }
               });
-      // JOSDK calls this on every retry attempt. Emitting each time would mean one blocking write
-      // per attempt against an API server that is often the cause of the failure, so only the
-      // first attempt publishes: the reason is stable, so a later attempt would only bump a count.
-      if (isFirstAttempt(context)) {
-        EventUtils.warn(
-            context.eventRecorder(),
-            EventUtils.REASON_RECONCILE_ERROR,
-            "Spark App Reconciliation failed. " + EventUtils.describe(e));
-      }
+      // JOSDK calls this on every retry attempt, and each one publishes. The event write is not
+      // retried, so a write which a struggling API server dropped is recovered by a later attempt,
+      // while ConfigurableEventRecorder drops a repeat with the same message within the minimum
+      // interval, so a failure which persists only bumps the count of the one event.
+      EventUtils.warn(
+          context.eventRecorder(),
+          EventUtils.REASON_RECONCILE_ERROR,
+          "Spark App Reconciliation failed. " + EventUtils.describe(e));
       return ErrorStatusUpdateControl.noStatusUpdate();
     } finally {
       trackedMDC.reset();
@@ -208,23 +206,24 @@ public class SparkAppReconciler implements Reconciler<SparkApplication>, Cleaner
     switch (app.getStatus().getCurrentState().getCurrentStateSummary()) {
       case Submitted, ScheduledToRestart -> steps.add(new AppInitStep());
       case DriverRequested, DriverStarted -> {
-        steps.add(new AppKueueEvictionStep());
         steps.add(
             new AppResourceObserveStep(
                 List.of(new AppDriverStartObserver(), new AppDriverReadyObserver())));
         steps.add(new AppResourceObserveStep(List.of(new AppDriverRunningObserver())));
         steps.add(new AppResourceObserveStep(List.of(new AppDriverTimeoutObserver())));
+        steps.add(new AppSuspendStep());
       }
       case DriverReady,
           InitializedBelowThresholdExecutors,
           RunningHealthy,
           RunningWithPartialCapacity,
           RunningWithBelowThresholdExecutors -> {
-        steps.add(new AppKueueEvictionStep());
         steps.add(new AppRunningStep());
         steps.add(new AppResourceObserveStep(List.of(new AppDriverRunningObserver())));
         steps.add(new AppResourceObserveStep(List.of(new AppDriverTimeoutObserver())));
+        steps.add(new AppSuspendStep());
       }
+      case Suspended -> steps.add(new AppSuspendStep());
       default -> steps.add(new AppUnknownStateStep());
     }
     return steps;

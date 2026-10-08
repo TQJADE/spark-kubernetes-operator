@@ -22,6 +22,7 @@ package org.apache.spark.k8s.operator.reconciler.reconcilesteps;
 import static java.net.HttpURLConnection.HTTP_CONFLICT;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -36,7 +37,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
-import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import io.fabric8.kubernetes.api.model.ConditionBuilder;
 import io.fabric8.kubernetes.api.model.KubernetesResourceList;
 import io.fabric8.kubernetes.api.model.ObjectMetaBuilder;
@@ -90,14 +90,12 @@ import org.apache.spark.k8s.operator.spec.WorkerInstanceConfig;
 import org.apache.spark.k8s.operator.status.ClusterState;
 import org.apache.spark.k8s.operator.status.ClusterStateSummary;
 import org.apache.spark.k8s.operator.status.ClusterStatus;
+import org.apache.spark.k8s.operator.status.SuspendReason;
 import org.apache.spark.k8s.operator.utils.EventUtils;
 import org.apache.spark.k8s.operator.utils.SparkClusterStatusRecorder;
 import org.apache.spark.k8s.operator.utils.TestUtils;
 
 @EnableKubernetesMockClient(crud = true)
-@SuppressFBWarnings(
-    value = {"UWF_UNWRITTEN_FIELD", "NP_UNWRITTEN_FIELD"},
-    justification = "Unwritten fields are covered by Kubernetes mock client")
 class ClusterSuspendStepTest {
   private static final String WORKLOAD_STATUS_PATH =
       "/apis/kueue.x-k8s.io/v1beta2/namespaces/default/workloads/sparkcluster-cluster1/status";
@@ -152,6 +150,7 @@ class ClusterSuspendStepTest {
     ClusterState state = captureAppendedState();
     Assertions.assertEquals(ClusterStateSummary.Suspended, state.getCurrentStateSummary());
     Assertions.assertEquals(Constants.CLUSTER_SUSPENDED_MESSAGE, state.getMessage());
+    Assertions.assertEquals(SuspendReason.SpecSuspend, state.getSuspendReason());
     // Nothing is released until Suspended is persisted, so that a cluster which is resumed in the
     // meantime is never left in RunningHealthy without its master and workers.
     Assertions.assertNotNull(get(masterStatefulSetSpec));
@@ -215,6 +214,8 @@ class ClusterSuspendStepTest {
   @ValueSource(booleans = {true, false})
   void stuckPodsReleaseKueueWorkloadAndAreReportedOnce(boolean suspend) {
     SparkCluster cluster = buildKueueCluster(ClusterStateSummary.Suspended, suspend);
+    SuspendReason reason = suspend ? SuspendReason.SpecSuspend : SuspendReason.KueueEviction;
+    cluster.getStatus().getCurrentState().setSuspendReason(reason);
     KubernetesClient client = spy(kubernetesClient);
     // Pods stuck in terminating, e.g. on a lost node, do not hold the quota forever
     stubStuckPods(client);
@@ -235,6 +236,8 @@ class ClusterSuspendStepTest {
             Constants.CLUSTER_SUSPENDED_WITH_STUCK_PODS_MESSAGE,
             "cluster1-master-0, cluster1-worker-0"),
         state.getMessage());
+    // The state which names the stuck pods keeps the reason of the one before
+    Assertions.assertEquals(reason, state.getSuspendReason());
 
     // The same state is not appended again on every requeue
     cluster.setStatus(cluster.getStatus().appendNewState(state));
@@ -504,14 +507,22 @@ class ClusterSuspendStepTest {
   }
 
   @ParameterizedTest
-  @CsvSource({"Preempted, true", "Deactivated, false", "Deactivated, true"})
+  @CsvSource({
+    "Preempted, true",
+    "PodsReadyTimeout, true",
+    "Deactivated, false",
+    "Deactivated, true"
+  })
   void evictedRunningClusterEntersSuspendedBeforeReleasingResources(String reason, boolean active) {
     // A deactivated Workload no longer counts against the quota, and a reactivated one is queued
-    // again, so both release the master and workers like a preemption
+    // again, so both release the master and workers like a preemption. So does a PodsReadyTimeout
+    // like the built-in Kueue integrations, even if the master and workers are ready by now
     SparkCluster cluster = buildKueueCluster(ClusterStateSummary.RunningHealthy, false);
     stubContext(cluster);
     createRunningCluster();
     createWorkload(cluster, evictedStatus(reason), active);
+    when(mockContext.getEventRecorder()).thenReturn(eventRecorder);
+    stubReadyPods(1L, 1L);
 
     Assertions.assertEquals(
         ReconcileProgress.completeAndImmediateRequeue(),
@@ -522,11 +533,16 @@ class ClusterSuspendStepTest {
     Assertions.assertEquals(
         Constants.CLUSTER_EVICTED_MESSAGE + " " + reason + ": " + reason + " by the test",
         state.getMessage());
+    Assertions.assertEquals(SuspendReason.KueueEviction, state.getSuspendReason());
     // Like spec.suspend, nothing is released until Suspended is persisted, and the Workload is
     // released only after the master and worker pods are gone
     Assertions.assertNotNull(get(masterStatefulSetSpec));
     Assertions.assertNotNull(get(workerStatefulSetSpec));
     Assertions.assertNotNull(getWorkload());
+    // Nothing is recorded on the Workload which is about to be released, and nothing is reported
+    // but the Suspended state
+    Assertions.assertFalse(getWorkload().getStatus().isPodsReady());
+    verifyNoInteractions(eventRecorder);
   }
 
   @ParameterizedTest
@@ -559,7 +575,8 @@ class ClusterSuspendStepTest {
                     ClusterStateSummary.Suspended,
                     String.format(
                         Constants.CLUSTER_SUSPENDED_WITH_STUCK_PODS_MESSAGE,
-                        "cluster1-master-0"))));
+                        "cluster1-master-0"),
+                    SuspendReason.KueueEviction)));
     stubContext(cluster);
 
     Assertions.assertEquals(
@@ -625,6 +642,73 @@ class ClusterSuspendStepTest {
   }
 
   @Test
+  void evictedWorkloadIsReleasedOnceTheRequeueBackoffElapsesWhilePodsAreStuck() {
+    SparkCluster cluster = buildEvictedCluster(false);
+    KubernetesClient client = spy(kubernetesClient);
+    stubStuckPods(client);
+    stubContext(cluster, client);
+    WorkloadStatus status = evictedStatus("PodsReadyTimeout");
+    status.setRequeueState(
+        RequeueState.builder()
+            .count(1)
+            .requeueAt(Instant.now().plusSeconds(60).toString())
+            .build());
+    createWorkload(cluster, status);
+
+    ReconcileProgress progress = new ClusterSuspendStep().reconcile(mockContext, recorder);
+
+    // Rather than after the hold interval of the stuck pods, which would keep the quota for up to
+    // 30 minutes past the backoff
+    Assertions.assertTrue(progress.isRequeue());
+    Assertions.assertTrue(
+        progress.getRequeueAfterDuration().compareTo(Duration.ofSeconds(60)) <= 0,
+        progress.getRequeueAfterDuration().toString());
+    Assertions.assertNotNull(getWorkload());
+  }
+
+  @Test
+  void failedReleaseIsRetriedWhileDeactivatedWorkloadIsKept() {
+    SparkCluster cluster = buildEvictedCluster(false);
+    KubernetesClient mockClient = mock(KubernetesClient.class);
+    when(mockClient.apps())
+        .thenThrow(new KubernetesClientException("Service Unavailable", 503, null));
+    stubContext(cluster, mockClient);
+    createWorkload(cluster, evictedStatus("Deactivated"), false);
+
+    // Rather than after the hold interval of the deactivated Workload, which would keep the master
+    // and workers running for up to 30 minutes outside of the quota
+    Assertions.assertEquals(
+        ReconcileProgress.completeAndDefaultRequeue(),
+        new ClusterSuspendStep().reconcile(mockContext, recorder));
+  }
+
+  @Test
+  void podReleaseDeadlineIsNotPushedBackByALongerBackoff() {
+    SparkCluster cluster = buildEvictedCluster(false);
+    KubernetesClient client = spy(kubernetesClient);
+    stubPodList(
+        client,
+        terminatingPod(
+            "cluster1-master-0", Constants.LABEL_SPARK_ROLE_MASTER_VALUE, Duration.ofSeconds(270)));
+    stubContext(cluster, client);
+    WorkloadStatus status = evictedStatus("PodsReadyTimeout");
+    status.setRequeueState(
+        RequeueState.builder()
+            .count(1)
+            .requeueAt(Instant.now().plusSeconds(600).toString())
+            .build());
+    createWorkload(cluster, status);
+
+    ReconcileProgress progress = new ClusterSuspendStep().reconcile(mockContext, recorder);
+
+    // The wait is still requeued to end when the pod has been terminating for the timeout, rather
+    // than once the backoff of the Workload elapses, since the pod may send no more events
+    Assertions.assertTrue(
+        progress.getRequeueAfterDuration().compareTo(Duration.ofSeconds(30)) <= 0,
+        progress.getRequeueAfterDuration().toString());
+  }
+
+  @Test
   void suspendingEvictedClusterIsRecorded() {
     SparkCluster cluster = buildEvictedCluster(true);
     stubContext(cluster);
@@ -638,12 +722,35 @@ class ClusterSuspendStepTest {
     ClusterState state = captureAppendedState();
     Assertions.assertEquals(ClusterStateSummary.Suspended, state.getCurrentStateSummary());
     Assertions.assertEquals(Constants.CLUSTER_SUSPENDED_MESSAGE, state.getMessage());
+    Assertions.assertEquals(SuspendReason.SpecSuspend, state.getSuspendReason());
 
     // Once that state is persisted, the cluster is held rather than suspended again
     cluster.setStatus(cluster.getStatus().appendNewState(state));
     Assertions.assertEquals(
         SUSPEND_HOLD_PROGRESS, new ClusterSuspendStep().reconcile(mockContext, recorder));
     verify(recorder).appendNewStateAndPersist(any(), any());
+  }
+
+  @Test
+  void evictionIsToldByTheSuspendReasonRatherThanByTheMessage() {
+    // A reworded message of a cluster suspended by an eviction before still says so
+    SparkCluster evicted = buildEvictedCluster(false);
+    evicted.getStatus().getCurrentState().setMessage("Reworded in another version");
+    stubContext(evicted);
+    createWorkload(evicted, evictedStatus("Preempted"), true);
+    new ClusterSuspendStep().reconcile(mockContext, recorder);
+    Assertions.assertEquals(
+        Constants.CLUSTER_REQUEUED_MESSAGE, capturePersistedState().getMessage());
+
+    // So does a Suspended state without a reason, even if its message looks like an eviction
+    SparkCluster unknown = buildEvictedCluster(false);
+    unknown.getStatus().getCurrentState().setSuspendReason(null);
+    stubContext(unknown);
+    createWorkload(unknown, evictedStatus("Preempted"), true);
+    clearInvocations(recorder);
+    new ClusterSuspendStep().reconcile(mockContext, recorder);
+    Assertions.assertEquals(
+        Constants.CLUSTER_RESUMED_MESSAGE, capturePersistedState().getMessage());
   }
 
   @Test
@@ -734,42 +841,6 @@ class ClusterSuspendStepTest {
         new ClusterSuspendStep().reconcile(mockContext, recorder));
 
     Assertions.assertFalse(getWorkload().getStatus().isPodsReady());
-    verifyNoInteractions(recorder);
-  }
-
-  @Test
-  void podsReadyIsRecordedAfterAPodsReadyTimeout() {
-    SparkCluster cluster = buildKueueCluster(ClusterStateSummary.RunningHealthy, false);
-    stubContext(cluster);
-    createWorkload(cluster, evictedStatus("PodsReadyTimeout"));
-    when(mockContext.getEventRecorder()).thenReturn(eventRecorder);
-    stubReadyPods(1L, 1L);
-
-    Assertions.assertEquals(
-        ReconcileProgress.proceed(), new ClusterSuspendStep().reconcile(mockContext, recorder));
-
-    // Kueue keeps counting the quota of the Workload, so that with blockAdmission, it would hold
-    // back every other workload without the condition
-    Assertions.assertTrue(getWorkload().getStatus().isPodsReady());
-    verifyNoInteractions(recorder);
-  }
-
-  @Test
-  void podsReadyTimeoutIsReportedAndIgnored() {
-    SparkCluster cluster = buildKueueCluster(ClusterStateSummary.RunningHealthy, false);
-    stubContext(cluster);
-    createWorkload(cluster, evictedStatus("PodsReadyTimeout"));
-    when(mockContext.getEventRecorder()).thenReturn(eventRecorder);
-
-    // Kueue keeps counting its quota, while the master and workers are not released yet
-    Assertions.assertEquals(
-        ReconcileProgress.proceed(), new ClusterSuspendStep().reconcile(mockContext, recorder));
-
-    Assertions.assertNotNull(getWorkload());
-    ArgumentCaptor<EventRecord> event = ArgumentCaptor.forClass(EventRecord.class);
-    verify(eventRecorder).record(event.capture());
-    Assertions.assertEquals(EventType.WARNING, event.getValue().type());
-    Assertions.assertEquals(EventUtils.REASON_KUEUE_EVICTION_IGNORED, event.getValue().reason());
     verifyNoInteractions(recorder);
   }
 
@@ -899,6 +970,7 @@ class ClusterSuspendStepTest {
         .getStatus()
         .getCurrentState()
         .setMessage(Constants.CLUSTER_EVICTED_MESSAGE + " Preempted: Preempted by the test");
+    cluster.getStatus().getCurrentState().setSuspendReason(SuspendReason.KueueEviction);
     return cluster;
   }
 

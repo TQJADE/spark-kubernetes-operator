@@ -40,18 +40,23 @@ import io.javaoperatorsdk.operator.api.event.DefaultEventRecorder;
 import io.javaoperatorsdk.operator.api.event.DefaultEventSink;
 import io.javaoperatorsdk.operator.api.event.EventRecord;
 import io.javaoperatorsdk.operator.api.event.EventRecorder;
+import io.javaoperatorsdk.operator.api.event.EventType;
 import io.javaoperatorsdk.operator.api.event.ResourceEventRecorder;
 import io.javaoperatorsdk.operator.api.reconciler.Context;
 import lombok.extern.slf4j.Slf4j;
 
+import org.apache.spark.k8s.operator.client.KubernetesClientFactory;
+
 /**
- * An {@link EventRecorder} that drops every event unless {@link
- * org.apache.spark.k8s.operator.config.SparkOperatorConf#KUBERNETES_EVENTS_ENABLED} is set, drops
+ * An {@link EventRecorder} that drops every event while {@link
+ * org.apache.spark.k8s.operator.config.SparkOperatorConf#KUBERNETES_EVENTS_ENABLED} is false, drops
  * events whose reason matches one of the patterns in {@link
  * org.apache.spark.k8s.operator.config.SparkOperatorConf#KUBERNETES_EVENTS_EXCLUDED_REASONS}, and
  * drops an event repeated on the same resource with the same reason and the same message within
  * {@link
  * org.apache.spark.k8s.operator.config.SparkOperatorConf#KUBERNETES_EVENTS_MIN_INTERVAL_SECONDS}.
+ * A {@code Warning} event published on a resource ends the interval of its {@code Normal} events,
+ * so that the next one is published even if it repeats, see {@link #withinMinInterval}.
  *
  * <p>Registered once for the whole operator via {@link
  * io.javaoperatorsdk.operator.api.config.ConfigurationServiceOverrider#withEventRecorder}, so that
@@ -102,13 +107,21 @@ public class ConfigurableEventRecorder implements EventRecorder {
   }
 
   /**
-   * Constructs a recorder over the JOSDK defaults, writing events with the given client.
+   * Constructs a recorder over the JOSDK defaults, writing events with a client derived from the
+   * given one which does not retry a failed request.
    *
-   * @param client The Kubernetes client used to write events.
+   * <p>{@link DefaultEventSink} writes on the reconciliation thread, and an error event often
+   * reports a failure of the API server itself, so a failed write is dropped like any other write
+   * failure rather than retried with backoff while the reconciliation waits. A write which the API
+   * server does not answer still waits for the request timeout of the given client.
+   *
+   * @param client The Kubernetes client to derive the client which writes events from.
    * @return A recorder gated on the events config option.
    */
   public static ConfigurableEventRecorder withDefaultSink(KubernetesClient client) {
-    return new ConfigurableEventRecorder(new DefaultEventRecorder(new DefaultEventSink(client)));
+    return new ConfigurableEventRecorder(
+        new DefaultEventRecorder(
+            new DefaultEventSink(KubernetesClientFactory.withoutRetries(client))));
   }
 
   /**
@@ -149,9 +162,7 @@ public class ConfigurableEventRecorder implements EventRecorder {
   }
 
   private static boolean eventsEnabled() {
-    // Boolean.TRUE.equals guards against a null resolved value, which the option can yield for a
-    // malformed override. Publishing events must never break a reconciliation.
-    return Boolean.TRUE.equals(KUBERNETES_EVENTS_ENABLED.getValue());
+    return KUBERNETES_EVENTS_ENABLED.getValue();
   }
 
   private static boolean isExcluded(String reason) {
@@ -178,6 +189,13 @@ public class ConfigurableEventRecorder implements EventRecorder {
    * what the last one said is free of new information. A reason whose message varies between
    * repeats, such as one embedding the cause of a failure, keeps reaching the user.
    *
+   * <p>A {@code Normal} event which repeats after a {@code Warning} event on the same resource is
+   * not free of new information either: it says that the condition the warning reported is over,
+   * e.g. a suspended resource held again once its driver or master can be read, while the warning
+   * would otherwise stay the newest event until the interval ends. So a published warning drops
+   * the {@code Normal} entries of its resource. That scans the map, which is kept to the events of
+   * the last interval, only when a warning is published, not on every event.
+   *
    * @param event The event to record.
    * @param uid The uid of the resource the event is about, null when it cannot be determined.
    * @return Whether the event is a repeat that should be dropped.
@@ -199,7 +217,7 @@ public class ConfigurableEventRecorder implements EventRecorder {
     AtomicBoolean admitted = new AtomicBoolean();
     // compute is atomic per key, so concurrent reconcile threads cannot both admit the same event.
     lastRecorded.compute(
-        new RecordedEvent(uid, event.reason(), event.message()),
+        new RecordedEvent(uid, event.type(), event.reason(), event.message()),
         (key, previous) -> {
           if (previous == null || now - previous >= minInterval) {
             admitted.set(true);
@@ -207,6 +225,11 @@ public class ConfigurableEventRecorder implements EventRecorder {
           }
           return previous;
         });
+    if (admitted.get() && event.type() == EventType.WARNING) {
+      lastRecorded
+          .keySet()
+          .removeIf(key -> key.type() == EventType.NORMAL && key.uid().equals(uid));
+    }
     return !admitted.get();
   }
 
@@ -261,10 +284,7 @@ public class ConfigurableEventRecorder implements EventRecorder {
   }
 
   private static long minIntervalNanos() {
-    Long seconds = KUBERNETES_EVENTS_MIN_INTERVAL_SECONDS.getValue();
-    // An unparseable override falls back to the default, but an override of the literal 'null'
-    // resolves to null, which is treated as no limit rather than throwing out of a reconciliation.
-    return seconds == null ? 0L : TimeUnit.SECONDS.toNanos(seconds);
+    return TimeUnit.SECONDS.toNanos(KUBERNETES_EVENTS_MIN_INTERVAL_SECONDS.getValue());
   }
 
   private static boolean matches(String regex, String reason) {
@@ -279,7 +299,7 @@ public class ConfigurableEventRecorder implements EventRecorder {
   }
 
   /** Identity of an event for the purpose of the minimum interval. */
-  private record RecordedEvent(String uid, String reason, String message) {}
+  private record RecordedEvent(String uid, EventType type, String reason, String message) {}
 
   private record BoundRecorder(EventRecorder delegate, Context<?> context)
       implements ResourceEventRecorder {

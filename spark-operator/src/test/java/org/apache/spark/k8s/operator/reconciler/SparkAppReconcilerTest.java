@@ -38,7 +38,6 @@ import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.mockConstruction;
-import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -72,6 +71,8 @@ import io.javaoperatorsdk.operator.processing.event.ResourceID;
 import io.javaoperatorsdk.operator.processing.event.source.informer.InformerEventSource;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 import org.mockito.MockedConstruction;
 import org.mockito.MockedStatic;
@@ -86,9 +87,10 @@ import org.apache.spark.k8s.operator.kueue.KueueWorkloadUtils;
 import org.apache.spark.k8s.operator.kueue.v1beta2.Workload;
 import org.apache.spark.k8s.operator.kueue.v1beta2.WorkloadStatus;
 import org.apache.spark.k8s.operator.metrics.healthcheck.SentinelManager;
-import org.apache.spark.k8s.operator.reconciler.reconcilesteps.AppKueueEvictionStep;
+import org.apache.spark.k8s.operator.reconciler.reconcilesteps.AppCleanUpStep;
 import org.apache.spark.k8s.operator.reconciler.reconcilesteps.AppReconcileStep;
-import org.apache.spark.k8s.operator.reconciler.reconcilesteps.AppResourceObserveStep;
+import org.apache.spark.k8s.operator.reconciler.reconcilesteps.AppSuspendStep;
+import org.apache.spark.k8s.operator.reconciler.reconcilesteps.AppValidateStep;
 import org.apache.spark.k8s.operator.spec.ApplicationSpec;
 import org.apache.spark.k8s.operator.spec.ApplicationTolerations;
 import org.apache.spark.k8s.operator.spec.RestartConfig;
@@ -103,6 +105,11 @@ import org.apache.spark.k8s.operator.utils.SparkAppStatusRecorder;
 import org.apache.spark.k8s.operator.utils.Utils;
 
 class SparkAppReconcilerTest {
+  private static final Set<ApplicationStateSummary> DRIVER_REQUESTED_STATES =
+      EnumSet.range(
+          ApplicationStateSummary.DriverRequested,
+          ApplicationStateSummary.RunningWithBelowThresholdExecutors);
+
   private final SparkAppStatusRecorder mockRecorder = mock(SparkAppStatusRecorder.class);
   private final SentinelManager<SparkApplication> mockSentinelManager = mock(SentinelManager.class);
   private final KubernetesClient mockClient = mock(KubernetesClient.class);
@@ -422,7 +429,7 @@ class SparkAppReconcilerTest {
   }
 
   @Test
-  void updateErrorStatusPublishesOnlyOnTheFirstAttempt() {
+  void updateErrorStatusPublishesOnARetryToo() {
     when(mockContext.eventRecorder()).thenReturn(mockEventRecorder);
     var retryInfo = mock(RetryInfo.class);
     when(retryInfo.getAttemptCount()).thenReturn(1);
@@ -430,9 +437,9 @@ class SparkAppReconcilerTest {
 
     reconciler.updateErrorStatus(app, mockContext, new RuntimeException("boom"));
 
-    // JOSDK calls this on every retry attempt, each emit is a blocking write against an API
-    // server that is often the cause of the failure.
-    verify(mockEventRecorder, never()).record(any(EventRecord.class));
+    // The event write is not retried, so a retry attempt recovers a write which a struggling API
+    // server dropped, while the recorder drops an unchanged repeat within the minimum interval.
+    assertThat(captureRecordedEvent().reason()).isEqualTo(EventUtils.REASON_RECONCILE_ERROR);
   }
 
   @Test
@@ -530,10 +537,13 @@ class SparkAppReconcilerTest {
     }
   }
 
-  @Test
-  void observeStepsRecordDriverCompletedBeforeFirstObservationAsSucceededOnly() {
+  @ParameterizedTest
+  @ValueSource(booleans = {false, true})
+  void stepsRecordDriverCompletedBeforeFirstObservationAsSucceededOnly(boolean suspend) {
     app.setMetadata(new ObjectMetaBuilder().withName("app").withNamespace("default").build());
     app.setSpec(new ApplicationSpec());
+    // Even if suspended, the attempt ends as usual rather than being run again on resume
+    app.getSpec().setSuspend(suspend);
     Pod driver =
         new PodBuilder()
             .withNewMetadata()
@@ -566,14 +576,16 @@ class SparkAppReconcilerTest {
             });
 
     for (ApplicationStateSummary summary :
-        List.of(ApplicationStateSummary.DriverRequested, ApplicationStateSummary.DriverStarted)) {
+        List.of(
+            ApplicationStateSummary.DriverRequested,
+            ApplicationStateSummary.DriverStarted,
+            ApplicationStateSummary.RunningHealthy)) {
       app.setStatus(new ApplicationStatus().appendNewState(new ApplicationState(summary, "")));
       int previousSize = app.getStatus().getStateTransitionHistory().size();
       SparkAppContext context = new SparkAppContext(app, mockContext, mockWorker);
-      // Run the observe steps selected by the reconciler until one completes the reconciliation
+      // Run the steps selected by the reconciler until one completes the reconciliation
       for (AppReconcileStep step : reconciler.getReconcileSteps(app)) {
-        if (step instanceof AppResourceObserveStep
-            && step.reconcile(context, recorder).isCompleted()) {
+        if (step.reconcile(context, recorder).isCompleted()) {
           break;
         }
       }
@@ -588,22 +600,27 @@ class SparkAppReconcilerTest {
   }
 
   @Test
-  void kueueEvictionIsReportedFromTheDriverRequestUntilTheAttemptStops() {
-    Set<ApplicationStateSummary> driverRequested =
-        EnumSet.range(
-            ApplicationStateSummary.DriverRequested,
-            ApplicationStateSummary.RunningWithBelowThresholdExecutors);
+  void suspendStepRunsLastOnceTheDriverIsRequestedAndAloneWhileSuspended() {
     for (ApplicationStateSummary summary : ApplicationStateSummary.values()) {
       app.setStatus(new ApplicationStatus().appendNewState(new ApplicationState(summary, "")));
       List<AppReconcileStep> steps = reconciler.getReconcileSteps(app);
-      boolean expected = driverRequested.contains(summary);
-      // Right after the validation and the clean up, before a state transition ends the
-      // reconciliation. Before the driver is requested, AppInitStep handles the eviction itself.
-      assertEquals(expected, steps.get(2) instanceof AppKueueEvictionStep, summary.name());
-      assertEquals(
-          expected ? 1 : 0,
-          steps.stream().filter(AppKueueEvictionStep.class::isInstance).count(),
-          summary.name());
+      if (summary == ApplicationStateSummary.Suspended) {
+        // Not handled as an unknown state, which would fail the application
+        assertEquals(
+            List.of(AppValidateStep.class, AppCleanUpStep.class, AppSuspendStep.class),
+            steps.stream().map(Object::getClass).toList());
+      } else {
+        boolean expected = DRIVER_REQUESTED_STATES.contains(summary);
+        // After the observers, so that a driver which completed meanwhile is recorded rather than
+        // suspended, by spec.suspend or by a Kueue eviction, and run again when the application is
+        // resumed. Before the driver is requested, AppInitStep handles both itself.
+        assertEquals(
+            expected, steps.get(steps.size() - 1) instanceof AppSuspendStep, summary.name());
+        assertEquals(
+            expected ? 1 : 0,
+            steps.stream().filter(AppSuspendStep.class::isInstance).count(),
+            summary.name());
+      }
     }
   }
 }

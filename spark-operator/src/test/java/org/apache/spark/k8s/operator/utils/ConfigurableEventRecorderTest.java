@@ -98,15 +98,16 @@ class ConfigurableEventRecorderTest {
 
   @Test
   void dropsEventsWhileDisabled() {
-    // The option defaults to false, so an operator that never opts in writes nothing.
+    setEventsEnabled(false);
+
     recorder.record(EventRecord.warning("ReconcileError", "boom"), context);
 
     verifyNoInteractions(delegate);
   }
 
   @Test
-  void forwardsEventsWhileEnabled() {
-    setEventsEnabled(true);
+  void forwardsEventsByDefault() {
+    // The option defaults to true, so an operator that never configures it publishes events.
     EventRecord event = EventRecord.warning("ReconcileError", "boom");
 
     recorder.record(event, context);
@@ -118,6 +119,7 @@ class ConfigurableEventRecorderTest {
   void boundRecorderIsGatedOnTheFlagRatherThanOnBindingTime() {
     // Bound while disabled, then enabled mid reconciliation: the dynamic override has to take
     // effect, which it only does if the flag is read per event and not when forContext is called.
+    setEventsEnabled(false);
     var bound = recorder.forContext(context);
     bound.warn("ReconcileError", "dropped");
     verifyNoInteractions(delegate);
@@ -144,15 +146,16 @@ class ConfigurableEventRecorderTest {
   }
 
   @Test
-  void treatsAMalformedOverrideAsDisabled() {
-    // The option is a boxed Boolean, so a malformed override can resolve to null. Publishing an
+  void treatsAMalformedOverrideAsEnabled() {
+    // A malformed override falls back to the default value, which is enabled. Publishing an
     // event must never be the thing that throws out of a reconciliation.
     SparkOperatorConfManager.INSTANCE.refresh(
         Map.of(KUBERNETES_EVENTS_ENABLED.getKey(), "null"));
+    EventRecord event = EventRecord.warning("ReconcileError", "boom");
 
-    recorder.record(EventRecord.warning("ReconcileError", "boom"), context);
+    recorder.record(event, context);
 
-    verifyNoInteractions(delegate);
+    verify(delegate).record(event, context);
   }
 
   @Test
@@ -374,6 +377,36 @@ class ConfigurableEventRecorderTest {
   }
 
   @Test
+  void publishesARepeatedNormalEventAfterAWarningOnTheSameResource() {
+    // A Normal event repeated after a Warning says that the warning no longer applies, e.g.
+    // SuspendHeld once the check which SuspendCheckFailed reported succeeds again, so it is not
+    // dropped, or the warning would stay the newest event until the interval ends.
+    setMinIntervalSeconds(300L);
+    Context<?> context = contextOf("uid-1");
+    Context<?> other = contextOf("uid-2");
+    EventRecord held = EventRecord.normal("SuspendHeld", "held");
+    EventRecord otherHeld = EventRecord.normal("SuspendHeld", "held");
+    EventRecord failed = EventRecord.warning("SuspendCheckFailed", "boom");
+    EventRecord heldAgain = EventRecord.normal("SuspendHeld", "held");
+
+    timedRecorder.record(held, context);
+    timedRecorder.record(otherHeld, other);
+    elapseSeconds(60L);
+    timedRecorder.record(failed, context);
+    elapseSeconds(60L);
+    timedRecorder.record(heldAgain, context);
+    timedRecorder.record(EventRecord.normal("SuspendHeld", "held"), context);
+    // Another resource is not affected by the warning
+    timedRecorder.record(EventRecord.normal("SuspendHeld", "held"), other);
+
+    verify(delegate).record(held, context);
+    verify(delegate).record(otherHeld, other);
+    verify(delegate).record(failed, context);
+    verify(delegate).record(heldAgain, context);
+    verifyNoMoreInteractions(delegate);
+  }
+
+  @Test
   void limitsEachReasonIndependently() {
     setMinIntervalSeconds(300L);
     Context<?> context = contextOf("uid-1");
@@ -464,9 +497,9 @@ class ConfigurableEventRecorderTest {
   }
 
   @Test
-  void treatsAMalformedMinIntervalOverrideAsNoLimit() {
-    // The option is a boxed Long, so a malformed override can resolve to null. Unlike the enabled
-    // flag, which then drops every event, a limit that cannot be read must not drop any.
+  void usesTheDefaultMinIntervalForAMalformedOverride() {
+    // A malformed override falls back to the default value like the enabled flag, rather than
+    // lifting the limit.
     SparkOperatorConfManager.INSTANCE.refresh(
         Map.of(
             KUBERNETES_EVENTS_ENABLED.getKey(),
@@ -475,13 +508,13 @@ class ConfigurableEventRecorderTest {
             "null"));
     Context<?> context = contextOf("uid-1");
     EventRecord first = EventRecord.normal("KueueAdmissionPending", "queued");
-    EventRecord second = EventRecord.normal("KueueAdmissionPending", "queued");
 
     timedRecorder.record(first, context);
-    timedRecorder.record(second, context);
+    elapseSeconds(KUBERNETES_EVENTS_MIN_INTERVAL_SECONDS.getDefaultValue() - 1);
+    timedRecorder.record(EventRecord.normal("KueueAdmissionPending", "queued"), context);
 
     verify(delegate).record(first, context);
-    verify(delegate).record(second, context);
+    verifyNoMoreInteractions(delegate);
   }
 
   @Test

@@ -52,6 +52,7 @@ import org.apache.spark.k8s.operator.status.ApplicationAttemptSummary;
 import org.apache.spark.k8s.operator.status.ApplicationState;
 import org.apache.spark.k8s.operator.status.ApplicationStateSummary;
 import org.apache.spark.k8s.operator.status.ApplicationStatus;
+import org.apache.spark.k8s.operator.utils.EventUtils;
 import org.apache.spark.k8s.operator.utils.ReconcilerUtils;
 import org.apache.spark.k8s.operator.utils.SparkAppStatusRecorder;
 
@@ -81,16 +82,17 @@ public final class AppInitStep extends AppReconcileStep {
       } catch (KubernetesClientException e) {
         // Whether a driver of this attempt is live is unknown, not answered. Holding would claim
         // in an event that none was requested, and would do so for the whole suspend hold
-        // interval. It would also release the Kueue quota of a running driver, so look again with
-        // the steady-state interval instead.
-        log.warn("Failed to verify the driver pod of a suspended application, will retry.", e);
-        return completeAndDefaultRequeue();
+        // interval. It would also release the Kueue quota of a running driver.
+        return SuspendUtils.retryAfterCheckFailure(context, e, "driver");
       }
       if (!driverRequested) {
         return SuspendUtils.holdForSuspend(context, "driver");
       }
     }
-    if (app.getStatus().getPreviousAttemptSummary() != null) {
+    // Only a restarted attempt waits for the restart backoff, while the attempt which a suspended
+    // application starts on resume is Submitted.
+    if (ApplicationStateSummary.ScheduledToRestart == currentState.getCurrentStateSummary()
+        && app.getStatus().getPreviousAttemptSummary() != null) {
       Instant lastTransitionTime = Instant.parse(currentState.getLastTransitionTime());
       ApplicationAttemptSummary attemptSummary = app.getStatus().getPreviousAttemptSummary();
       SortedMap<Long, ApplicationState> attemptHistory = attemptSummary.getStateTransitionHistory();
@@ -162,8 +164,15 @@ public final class AppInitStep extends AppReconcileStep {
               .getStatus()
               .appendNewState(
                   new ApplicationState(ApplicationStateSummary.SchedulingFailure, errorMessage));
-      return attemptStatusUpdate(
-          context, statusRecorder, updatedStatus, completeAndImmediateRequeue());
+      // The status keeps the stack trace, while the event, which reaches more readers, only
+      // describes the failure, like the other warning events.
+      if (!statusRecorder.persistStatus(
+          context,
+          updatedStatus,
+          Constants.SCHEDULE_FAILURE_MESSAGE + " " + EventUtils.describe(e))) {
+        log.warn("Failed to persist status, will retry status update in next reconcile attempt");
+      }
+      return completeAndImmediateRequeue();
     }
     ApplicationStatus updatedStatus =
         context
@@ -206,7 +215,7 @@ public final class AppInitStep extends AppReconcileStep {
       if (driverRequested || isDriverRequested(context)) {
         // The driver resources are applied again in this reconcile, so the flavors of the Workload
         // which was admitted before are resolved again instead of dropping them from the resources.
-        return KueueWorkloadUtils.applyAdmittedFlavors(context);
+        return KueueWorkloadUtils.applyAdmittedPodSetInfos(context);
       }
     } catch (KubernetesClientException e) {
       // Requesting the admission of a driver which is already running would be wrong, so the

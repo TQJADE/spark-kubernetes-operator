@@ -29,19 +29,23 @@ spec:
         bindings:
           - name: SPARK_APP_NAMESPACE
             value: default
+          - name: SPARK_APPLICATION_NAME
+            value: pi-java25
         timeout: 10m
-        file: spark-state-transition.yaml
+        file: "../assertions/spark-application/spark-state-transition.yaml"
     catch:
     - describe:
         apiVersion: spark.apache.org/v1
         kind: SparkApplication
         namespace: default
     - podLogs:
-        selector: spark-app-name=pi-java25
+        selector: spark.operator/spark-app-name=pi-java25
         namespace: default
+        tail: -1
     - podLogs:
         selector: app.kubernetes.io/name=spark-kubernetes-operator
         namespace: default
+        tail: -1
     finally:
     - script:
         timeout: 120s

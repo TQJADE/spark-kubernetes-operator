@@ -81,7 +81,7 @@ import org.apache.spark.k8s.operator.SparkAppSubmissionWorker;
 import org.apache.spark.k8s.operator.SparkApplication;
 import org.apache.spark.k8s.operator.config.SparkOperatorConf;
 import org.apache.spark.k8s.operator.context.SparkAppContext;
-import org.apache.spark.k8s.operator.kueue.KueuePodSetFlavor;
+import org.apache.spark.k8s.operator.kueue.KueuePodSetInfo;
 import org.apache.spark.k8s.operator.kueue.KueueWorkloadFactory;
 import org.apache.spark.k8s.operator.kueue.KueueWorkloadUtils;
 import org.apache.spark.k8s.operator.kueue.v1beta2.Admission;
@@ -104,7 +104,7 @@ import org.apache.spark.k8s.operator.utils.TestUtils;
 
 @EnableKubernetesMockClient(crud = true)
 @SuppressFBWarnings(
-    value = {"UWF_UNWRITTEN_FIELD", "NP_UNWRITTEN_FIELD", "UUF_UNUSED_FIELD"},
+    value = {"UUF_UNUSED_FIELD"},
     justification = "Unwritten fields are covered by Kubernetes mock client")
 class AppInitStepTest {
   private KubernetesMockServer mockServer;
@@ -409,6 +409,42 @@ class AppInitStepTest {
         application.getStatus().getCurrentState().getCurrentStateSummary());
   }
 
+  @ParameterizedTest
+  @ValueSource(booleans = {true, false})
+  void resumedAttemptDoesNotWaitForRestartBackoff(boolean trimStateTransitionHistory) {
+    // An attempt which starts as the application is resumed from Suspended is not a restart
+    AppInitStep appInitStep = new AppInitStep();
+    SparkAppContext mockContext = mock(SparkAppContext.class);
+    SparkAppStatusRecorder recorder = mock(SparkAppStatusRecorder.class);
+    SparkApplication application = new SparkApplication();
+    application.setMetadata(applicationMetadata);
+    application.getSpec().setApplicationTolerations(
+        ApplicationTolerations.builder()
+            .restartConfig(RestartConfig.builder().restartBackoffMillis(60000L).build())
+            .build());
+    application.setStatus(
+        new ApplicationStatus()
+            .appendNewState(new ApplicationState(ApplicationStateSummary.DriverRequested, ""))
+            .appendNewState(new ApplicationState(ApplicationStateSummary.Suspended, ""))
+            .resume("resumed", trimStateTransitionHistory));
+    when(mockContext.getResource()).thenReturn(application);
+    when(mockContext.getDriverPreResourcesSpec()).thenReturn(List.of());
+    when(mockContext.getDriverPodSpec()).thenReturn(driverPodSpec);
+    when(mockContext.getDriverResourcesSpec()).thenReturn(List.of());
+    when(mockContext.getClient()).thenReturn(kubernetesClient);
+    when(recorder.persistStatus(any(), any())).thenAnswer(invocation -> {
+      application.setStatus(invocation.getArgument(1));
+      return true;
+    });
+
+    Assertions.assertEquals(
+        ReconcileProgress.completeAndDefaultRequeue(),
+        appInitStep.reconcile(mockContext, recorder));
+    Assertions.assertEquals(
+        ApplicationStateSummary.DriverRequested,
+        application.getStatus().getCurrentState().getCurrentStateSummary());
+  }
+
   @Test
   void suspendedAppDoesNotRequestDriver() {
     AppInitStep appInitStep = new AppInitStep();
@@ -535,11 +571,13 @@ class AppInitStepTest {
     Assertions.assertEquals(EventUtils.REASON_SUSPEND_HELD, event.reason());
   }
 
-  @Test
-  void suspendedAppWithUnverifiableDriverIsNotHeld() {
+  @ParameterizedTest
+  @ValueSource(ints = {503, 429})
+  void suspendedAppWithUnverifiableDriverIsNotHeld(int code) {
     // A failed verification is not an answer: the driver of this attempt may be live, so the app
     // must not be held with an event claiming that none was requested, nor for the whole suspend
-    // hold interval.
+    // hold interval. Like a transport level failure, a throttled read publishes no event, which
+    // would only add load to an overloaded API server.
     AppInitStep appInitStep = new AppInitStep();
     SparkAppContext mockContext = mock(SparkAppContext.class);
     SparkAppStatusRecorder recorder = mock(SparkAppStatusRecorder.class);
@@ -548,7 +586,7 @@ class AppInitStepTest {
     application.getSpec().setSuspend(true);
     when(mockContext.getResource()).thenReturn(application);
     when(mockContext.getCurrentAttemptDriverPod())
-        .thenThrow(new KubernetesClientException("unavailable", 503, null));
+        .thenThrow(new KubernetesClientException("unavailable", code, null));
     when(mockContext.getEventRecorder()).thenReturn(eventRecorder);
 
     ReconcileProgress progress = appInitStep.reconcile(mockContext, recorder);
@@ -560,6 +598,36 @@ class AppInitStepTest {
     Assertions.assertEquals(
         ApplicationStateSummary.Submitted,
         application.getStatus().getCurrentState().getCurrentStateSummary());
+  }
+
+  @ParameterizedTest
+  @ValueSource(ints = {403, 500})
+  void suspendedAppWithPersistentlyUnverifiableDriverPublishesEvent(int code) {
+    // Unlike a transport level failure, a persistent one is reported, since a suspended app has no
+    // persisted status to show it. The event must not claim that no driver was requested.
+    AppInitStep appInitStep = new AppInitStep();
+    SparkAppContext mockContext = mock(SparkAppContext.class);
+    SparkAppStatusRecorder recorder = mock(SparkAppStatusRecorder.class);
+    SparkApplication application = new SparkApplication();
+    application.setMetadata(applicationMetadata);
+    application.getSpec().setSuspend(true);
+    when(mockContext.getResource()).thenReturn(application);
+    when(mockContext.getCurrentAttemptDriverPod())
+        .thenThrow(new KubernetesClientException("rejected", code, null));
+    when(mockContext.getEventRecorder()).thenReturn(eventRecorder);
+
+    ReconcileProgress progress = appInitStep.reconcile(mockContext, recorder);
+
+    Assertions.assertEquals(ReconcileProgress.completeAndDefaultRequeue(), progress);
+    verify(mockContext, never()).getDriverPodSpec();
+    verifyNoInteractions(recorder);
+    EventRecord event = captureEvents(1).get(0);
+    Assertions.assertEquals(EventType.WARNING, event.type());
+    Assertions.assertEquals(EventUtils.REASON_SUSPEND_CHECK_FAILED, event.reason());
+    Assertions.assertEquals(
+        "Failed to check whether the driver of the suspended SparkApplication was requested, "
+            + "will retry. KubernetesClientException: rejected",
+        event.message());
   }
 
   @Test
@@ -1135,7 +1203,7 @@ class AppInitStepTest {
     Assertions.assertEquals(ReconcileProgress.completeAndImmediateRequeue(), progress);
     Assertions.assertNull(getWorkload());
     ArgumentCaptor<ApplicationStatus> captor = ArgumentCaptor.forClass(ApplicationStatus.class);
-    verify(recorder).persistStatus(any(), captor.capture());
+    verify(recorder).persistStatus(any(), captor.capture(), any());
     Assertions.assertEquals(
         ApplicationStateSummary.SchedulingFailure,
         captor.getValue().getCurrentState().getCurrentStateSummary());
@@ -1341,7 +1409,7 @@ class AppInitStepTest {
 
     Assertions.assertEquals(ReconcileProgress.completeAndDefaultRequeue(), progress);
     Assertions.assertNull(getWorkload());
-    verify(mockContext, never()).setKueuePodSetFlavors(any());
+    verify(mockContext, never()).setKueuePodSetInfos(any());
     Assertions.assertEquals(
         ApplicationStateSummary.DriverRequested,
         application.getStatus().getCurrentState().getCurrentStateSummary());
@@ -1475,7 +1543,7 @@ class AppInitStepTest {
         ApplicationStateSummary.DriverRequested,
         application.getStatus().getCurrentState().getCurrentStateSummary());
     // Like a driver found in the cache, it gets the flavors of the admitted Workload again
-    verify(mockContext).setKueuePodSetFlavors(any());
+    verify(mockContext).setKueuePodSetInfos(any());
     // The driver found by the suspend check is not looked up again for the Kueue admission
     verify(mockContext).getCurrentAttemptDriverPod();
   }
@@ -1638,16 +1706,25 @@ class AppInitStepTest {
               throw new SparkException(
                   "Please specify spark.kubernetes.file.upload.path property.");
             });
-    when(recorder.persistStatus(any(), any())).thenReturn(true);
+    when(recorder.persistStatus(any(), any(), any())).thenReturn(true);
 
     ReconcileProgress progress = appInitStep.reconcile(mockContext, recorder);
 
     Assertions.assertEquals(ReconcileProgress.completeAndImmediateRequeue(), progress);
     ArgumentCaptor<ApplicationStatus> captor = ArgumentCaptor.forClass(ApplicationStatus.class);
-    verify(recorder).persistStatus(any(), captor.capture());
+    ArgumentCaptor<String> eventMessage = ArgumentCaptor.forClass(String.class);
+    verify(recorder).persistStatus(any(), captor.capture(), eventMessage.capture());
     Assertions.assertEquals(
         ApplicationStateSummary.SchedulingFailure,
         captor.getValue().getCurrentState().getCurrentStateSummary());
+    // The status keeps the stack trace, while the event only describes the failure
+    Assertions.assertTrue(
+        captor.getValue().getCurrentState().getMessage().contains("\tat "),
+        captor.getValue().getCurrentState().getMessage());
+    Assertions.assertEquals(
+        Constants.SCHEDULE_FAILURE_MESSAGE
+            + " SparkException: Please specify spark.kubernetes.file.upload.path property.",
+        eventMessage.getValue());
     Assertions.assertNotNull(getWorkload());
   }
 
@@ -1784,9 +1861,9 @@ class AppInitStepTest {
             "executor", Map.of("cpu", "spot-flavor", "memory", "spot-flavor")));
     appInitStep.reconcile(mockContext, recorder);
 
-    KueuePodSetFlavor flavor = new KueuePodSetFlavor(Map.of("pool", "spot"), List.of(spot));
+    KueuePodSetInfo flavor = new KueuePodSetInfo(Map.of("pool", "spot"), List.of(spot));
     InOrder inOrder = inOrder(mockContext);
-    inOrder.verify(mockContext).setKueuePodSetFlavors(Map.of("driver", flavor, "executor", flavor));
+    inOrder.verify(mockContext).setKueuePodSetInfos(Map.of("driver", flavor, "executor", flavor));
     inOrder.verify(mockContext).getDriverPreResourcesSpec();
     Assertions.assertNotNull(
         kubernetesClient.pods().inNamespace("default").withName("driver-pod").get());
@@ -1804,7 +1881,7 @@ class AppInitStepTest {
     when(mockContext.getClient()).thenReturn(kubernetesClient);
     when(mockContext.getEventRecorder()).thenReturn(eventRecorder);
     createFlavor("spot-flavor", Map.of("pool", "spot"), List.of());
-    when(recorder.persistStatus(any(), any())).thenReturn(true);
+    when(recorder.persistStatus(any(), any(), any())).thenReturn(true);
 
     appInitStep.reconcile(mockContext, recorder);
     admitWorkload(Map.of("driver", Map.of("cpu", "spot-flavor")));
@@ -1813,9 +1890,9 @@ class AppInitStepTest {
     // Like Kueue, the conflict is permanent, so the quota is released
     Assertions.assertEquals(ReconcileProgress.completeAndImmediateRequeue(), progress);
     Assertions.assertNull(getWorkload());
-    verify(mockContext, never()).setKueuePodSetFlavors(any());
+    verify(mockContext, never()).setKueuePodSetInfos(any());
     ArgumentCaptor<ApplicationStatus> captor = ArgumentCaptor.forClass(ApplicationStatus.class);
-    verify(recorder).persistStatus(any(), captor.capture());
+    verify(recorder).persistStatus(any(), captor.capture(), any());
     Assertions.assertEquals(
         ApplicationStateSummary.SchedulingFailure,
         captor.getValue().getCurrentState().getCurrentStateSummary());
@@ -1843,7 +1920,7 @@ class AppInitStepTest {
     // Like a persistent admission failure, it is retried with the default interval
     Assertions.assertEquals(ReconcileProgress.completeAndDefaultRequeue(), progress);
     Assertions.assertNotNull(getWorkload());
-    verify(mockContext, never()).setKueuePodSetFlavors(any());
+    verify(mockContext, never()).setKueuePodSetInfos(any());
     verifyNoInteractions(recorder);
     EventRecord event = captureEvents(2).get(1);
     Assertions.assertEquals(EventType.WARNING, event.type());
@@ -1888,8 +1965,8 @@ class AppInitStepTest {
     InOrder inOrder = inOrder(mockContext);
     inOrder
         .verify(mockContext)
-        .setKueuePodSetFlavors(
-            Map.of("driver", new KueuePodSetFlavor(Map.of("pool", "spot"), List.of(spot))));
+        .setKueuePodSetInfos(
+            Map.of("driver", new KueuePodSetInfo(Map.of("pool", "spot"), List.of(spot))));
     inOrder.verify(mockContext).getDriverPreResourcesSpec();
     Assertions.assertNotNull(getWorkload());
   }
@@ -1919,7 +1996,7 @@ class AppInitStepTest {
     ReconcileProgress progress = appInitStep.reconcile(mockContext, recorder);
 
     Assertions.assertEquals(ReconcileProgress.completeAndDefaultRequeue(), progress);
-    verify(mockContext, never()).setKueuePodSetFlavors(any());
+    verify(mockContext, never()).setKueuePodSetInfos(any());
     Assertions.assertNotNull(
         kubernetesClient.pods().inNamespace("default").withName("driver-pod").get());
     // The admitted Workload is released with the driver, like the one of a queued application
