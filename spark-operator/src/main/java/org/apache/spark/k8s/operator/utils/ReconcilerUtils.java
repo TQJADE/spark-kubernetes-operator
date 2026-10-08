@@ -47,6 +47,7 @@ import io.fabric8.kubernetes.api.model.HasMetadata;
 import io.fabric8.kubernetes.api.model.ListOptionsBuilder;
 import io.fabric8.kubernetes.api.model.ObjectMeta;
 import io.fabric8.kubernetes.api.model.ObjectMetaBuilder;
+import io.fabric8.kubernetes.api.model.OwnerReference;
 import io.fabric8.kubernetes.api.model.Pod;
 import io.fabric8.kubernetes.api.model.PodList;
 import io.fabric8.kubernetes.client.KubernetesClient;
@@ -206,6 +207,24 @@ public final class ReconcilerUtils {
           r.setMetadata(metaData);
         });
     client.resourceList(resources).forceConflicts().serverSideApply();
+  }
+
+  /**
+   * Checks whether the given resource has an owner reference to the given owner. The uid alone
+   * identifies the owner, since a name can be reused by a later resource, e.g. a resource left by a
+   * deleted owner of the same name which is still being garbage collected.
+   *
+   * @param resource The resource whose owner references are checked.
+   * @param owner The owner to look for.
+   * @return True if the resource is owned by the owner, false otherwise, including when the owner
+   *     has no uid yet.
+   */
+  public static boolean isOwnedBy(final HasMetadata resource, final HasMetadata owner) {
+    String uid = owner.getMetadata().getUid();
+    List<OwnerReference> ownerReferences = resource.getMetadata().getOwnerReferences();
+    return uid != null
+        && ownerReferences != null
+        && ownerReferences.stream().anyMatch(reference -> uid.equals(reference.getUid()));
   }
 
   /**

@@ -24,10 +24,11 @@ import static org.apache.spark.k8s.operator.utils.ModelUtils.buildOwnerReference
 import io.fabric8.kubernetes.api.model.HasMetadata;
 import io.fabric8.kubernetes.api.model.ObjectMeta;
 import io.fabric8.kubernetes.api.model.ObjectMetaBuilder;
-import io.fabric8.kubernetes.api.model.OwnerReference;
 import io.fabric8.kubernetes.api.model.Pod;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+
+import org.apache.spark.k8s.operator.utils.ReconcilerUtils;
 
 /**
  * Decorates Driver resources (except the pod). This makes sure all resources have owner reference
@@ -55,19 +56,7 @@ public class DriverResourceDecorator implements ResourceDecorator {
    */
   @Override
   public <T extends HasMetadata> T decorate(T resource) {
-    boolean ownerReferenceExists = false;
-    if (resource.getMetadata().getOwnerReferences() != null
-        && !resource.getMetadata().getOwnerReferences().isEmpty()) {
-      for (OwnerReference o : resource.getMetadata().getOwnerReferences()) {
-        if (driverPod.getKind().equals(o.getKind())
-            && driverPod.getMetadata().getName().equals(o.getName())
-            && driverPod.getMetadata().getUid().equals(o.getUid())) {
-          ownerReferenceExists = true;
-          break;
-        }
-      }
-    }
-    if (!ownerReferenceExists) {
+    if (!ReconcilerUtils.isOwnedBy(resource, driverPod)) {
       log.debug("Adding OwnerReference to driver for secondary resource");
       ObjectMeta metaData =
           new ObjectMetaBuilder(resource.getMetadata())

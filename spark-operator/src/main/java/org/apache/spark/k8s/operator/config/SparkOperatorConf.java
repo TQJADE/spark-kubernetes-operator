@@ -371,22 +371,25 @@ public final class SparkOperatorConf {
           .build();
 
   /**
-   * Minimum interval (in seconds) between two Kubernetes Events with the same reason and the same
-   * message on the same Spark resource.
+   * Minimum interval (in seconds) before an event which repeats the last Kubernetes Event on the
+   * same Spark resource, with the same type, reason and message, is published again.
    */
   public static final ConfigOption<Long> KUBERNETES_EVENTS_MIN_INTERVAL_SECONDS =
       ConfigOption.<Long>builder()
           .key("spark.kubernetes.operator.events.minIntervalSeconds")
           .enableDynamicOverride(true)
           .description(
-              "Minimum interval (in seconds) between two Kubernetes Events with the same reason "
-                  + "and the same message on the same Spark resource. The first event of a reason "
-                  + "on a resource is always published right away, only a repeat that says "
-                  + "exactly what the last one said is dropped. Such a repeat only bumps the "
+              "Minimum interval (in seconds) before an event which repeats the last Kubernetes "
+                  + "Event on the same Spark resource, with the same type, reason and message, is "
+                  + "published again. The first event on a resource is always published right "
+                  + "away, only a repeat that says exactly what the last one said is dropped. "
+                  + "Such a repeat only bumps the "
                   + "'count' of the one Event object, so it carries no information while it "
                   + "still costs a read and a write on the API server. A repeat whose message "
                   + "differs, for instance because it embeds the cause of a failure, is always "
                   + "published, since the operator rewrites the message of the existing Event. "
+                  + "Any other event on the resource in between ends the interval, so that the "
+                  + "events of a resource keep the order in which they happened. "
                   + "An event is only published when a reconciliation emits it, so the effective "
                   + "period is this interval rounded up to the next repeat. Keep this interval "
                   + "plus the interval at which the repeats are emitted within the '--event-ttl' "

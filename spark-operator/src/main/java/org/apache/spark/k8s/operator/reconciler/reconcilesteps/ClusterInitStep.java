@@ -20,6 +20,8 @@
 package org.apache.spark.k8s.operator.reconciler.reconcilesteps;
 
 import static org.apache.spark.k8s.operator.Constants.CLUSTER_READY_MESSAGE;
+import static org.apache.spark.k8s.operator.Constants.CLUSTER_REQUEUED_MESSAGE;
+import static org.apache.spark.k8s.operator.Constants.CLUSTER_RESUMED_MESSAGE;
 import static org.apache.spark.k8s.operator.Constants.CLUSTER_SCHEDULE_FAILURE_MESSAGE;
 import static org.apache.spark.k8s.operator.Constants.CLUSTER_SUSPENDED_MESSAGE;
 import static org.apache.spark.k8s.operator.config.SparkOperatorConf.KUEUE_ENABLED;
@@ -31,10 +33,8 @@ import static org.apache.spark.k8s.operator.utils.SparkExceptionUtils.buildGener
 
 import java.time.Duration;
 import java.time.Instant;
-import java.util.List;
 import java.util.Optional;
 
-import io.fabric8.kubernetes.api.model.OwnerReference;
 import io.fabric8.kubernetes.api.model.Service;
 import io.fabric8.kubernetes.api.model.apps.StatefulSet;
 import io.fabric8.kubernetes.api.model.networking.v1.NetworkPolicy;
@@ -72,7 +72,7 @@ public final class ClusterInitStep extends ClusterReconcileStep {
     }
     SparkCluster cluster = context.getResource();
     if (cluster.getSpec().isSuspend()) {
-      if (isInitialSubmission(cluster)) {
+      if (!isResumedOrRequeued(currentState)) {
         final boolean masterRequested;
         try {
           masterRequested = isMasterRequested(context);
@@ -87,9 +87,9 @@ public final class ClusterInitStep extends ClusterReconcileStep {
           return SuspendUtils.holdForSuspend(context, "master and workers");
         }
       }
-      // Only a first attempt whose master is known to be absent is held. A cluster resumed from
-      // Suspended or queued again after an eviction has persisted this Submitted state, which
-      // would keep saying that it is resumed or queued again, and a first attempt whose master
+      // Only a cluster whose master is known to be absent is held, unless it was resumed from
+      // Suspended or queued again after an eviction. Such a cluster has persisted this Submitted
+      // state, which would keep saying that it is resumed or queued again. A cluster whose master
       // exists was requested before, e.g. the status update to RunningHealthy failed. Either goes
       // to Suspended, where ClusterSuspendStep releases the master and workers whether or not they
       // were requested, rather than applying every resource again. So the master of a resumed or
@@ -264,19 +264,19 @@ public final class ClusterInitStep extends ClusterReconcileStep {
   }
 
   /**
-   * Checks whether the cluster has had no state but its initial Submitted state, which is never
-   * persisted while it is suspended. A cluster resumed from Suspended or queued again after a Kueue
-   * eviction has persisted another Submitted state instead, at a later key, since the keys of the
-   * state transition history keep increasing even when the history is trimmed. Only a cluster in
-   * its initial submission may have a master which was never requested, so only it looks the
-   * master up while suspended. A change which persists another state before the master is
-   * requested must keep this check in step with it.
+   * Checks whether the given Submitted state is the one which {@link ClusterSuspendStep} persists
+   * when it resumes a cluster from Suspended or queues it again after a Kueue eviction, once its
+   * master and workers are released. Only these states are known to follow a released master, so
+   * every other Submitted state of a suspended cluster looks the master up. A Submitted state which
+   * a later change may persist before the master is requested is then looked up as well, rather
+   * than sent to Suspended as if the cluster had run.
    *
-   * @param cluster The SparkCluster.
-   * @return True if the cluster is in its initial submission, false otherwise.
+   * @param state The current state of the cluster.
+   * @return True if the cluster was resumed or queued again, false otherwise.
    */
-  private static boolean isInitialSubmission(SparkCluster cluster) {
-    return cluster.getStatus().getStateTransitionHistory().lastKey() == 0L;
+  private static boolean isResumedOrRequeued(ClusterState state) {
+    return CLUSTER_RESUMED_MESSAGE.equals(state.getMessage())
+        || CLUSTER_REQUEUED_MESSAGE.equals(state.getMessage());
   }
 
   /**
@@ -297,14 +297,6 @@ public final class ClusterInitStep extends ClusterReconcileStep {
     // The name alone is not enough: a StatefulSet left by a deleted SparkCluster of the same
     // name, which is still being garbage collected, was not requested by this one, and would
     // otherwise move a recreated cluster which never ran to Suspended.
-    return master != null && isOwnedBy(master, context.getResource());
-  }
-
-  private static boolean isOwnedBy(StatefulSet statefulSet, SparkCluster cluster) {
-    String uid = cluster.getMetadata().getUid();
-    List<OwnerReference> ownerReferences = statefulSet.getMetadata().getOwnerReferences();
-    return uid != null
-        && ownerReferences != null
-        && ownerReferences.stream().anyMatch(reference -> uid.equals(reference.getUid()));
+    return master != null && ReconcilerUtils.isOwnedBy(master, context.getResource());
   }
 }

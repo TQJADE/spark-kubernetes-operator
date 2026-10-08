@@ -286,7 +286,10 @@ public final class Constants {
           + "on a lost node. It can be resumed only after they are gone, since they keep the "
           + "names of the pods to create again.";
 
-  /** Message indicating that the suspended cluster is resumed by clearing spec.suspend. */
+  /**
+   * Message indicating that the suspended cluster is resumed by clearing spec.suspend. The operator
+   * tells a resumed cluster by this message, which it persists as is, so it must not be formatted.
+   */
   public static final String CLUSTER_RESUMED_MESSAGE =
       "Cluster is resumed as spec.suspend is set to false.";
 
@@ -299,7 +302,10 @@ public final class Constants {
           + "Workload. It is queued again then, or once the Workload is reactivated if it was "
           + "deactivated.";
 
-  /** Message indicating that the cluster evicted by Kueue is submitted again. */
+  /**
+   * Message indicating that the cluster evicted by Kueue is submitted again. The operator tells a
+   * requeued cluster by this message, which it persists as is, so it must not be formatted.
+   */
   public static final String CLUSTER_REQUEUED_MESSAGE =
       "Cluster is submitted again after its eviction by Kueue.";
 

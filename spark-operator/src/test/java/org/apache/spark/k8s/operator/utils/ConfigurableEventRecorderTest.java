@@ -377,7 +377,81 @@ class ConfigurableEventRecorderTest {
   }
 
   @Test
-  void limitsEachReasonIndependently() {
+  void publishesARepeatedNormalEventAfterAWarningOnTheSameResource() {
+    // A Normal event repeated after a Warning says that the warning no longer applies, e.g.
+    // SuspendHeld once the check which SuspendCheckFailed reported succeeds again, so it is not
+    // dropped, or the warning would stay the newest event until the interval ends.
+    setMinIntervalSeconds(300L);
+    Context<?> context = contextOf("uid-1");
+    Context<?> other = contextOf("uid-2");
+    EventRecord held = EventRecord.normal("SuspendHeld", "held");
+    EventRecord otherHeld = EventRecord.normal("SuspendHeld", "held");
+    EventRecord failed = EventRecord.warning("SuspendCheckFailed", "boom");
+    EventRecord heldAgain = EventRecord.normal("SuspendHeld", "held");
+
+    timedRecorder.record(held, context);
+    timedRecorder.record(otherHeld, other);
+    elapseSeconds(60L);
+    timedRecorder.record(failed, context);
+    elapseSeconds(60L);
+    timedRecorder.record(heldAgain, context);
+    timedRecorder.record(EventRecord.normal("SuspendHeld", "held"), context);
+    // Another resource is not affected by the warning
+    timedRecorder.record(EventRecord.normal("SuspendHeld", "held"), other);
+
+    verify(delegate).record(held, context);
+    verify(delegate).record(otherHeld, other);
+    verify(delegate).record(failed, context);
+    verify(delegate).record(heldAgain, context);
+    verifyNoMoreInteractions(delegate);
+  }
+
+  @Test
+  void publishesARepeatedWarningEventAfterANormalOnTheSameResource() {
+    // A check which fails, succeeds and fails again within the interval: the second failure is
+    // not dropped, or the SuspendHeld in between would stay the newest event while the check is
+    // failing again.
+    setMinIntervalSeconds(300L);
+    Context<?> context = contextOf("uid-1");
+    EventRecord failed = EventRecord.warning("SuspendCheckFailed", "Forbidden");
+    EventRecord held = EventRecord.normal("SuspendHeld", "held");
+    EventRecord failedAgain = EventRecord.warning("SuspendCheckFailed", "Forbidden");
+
+    timedRecorder.record(failed, context);
+    elapseSeconds(60L);
+    timedRecorder.record(held, context);
+    elapseSeconds(60L);
+    timedRecorder.record(failedAgain, context);
+    timedRecorder.record(EventRecord.warning("SuspendCheckFailed", "Forbidden"), context);
+
+    verify(delegate).record(failed, context);
+    verify(delegate).record(held, context);
+    verify(delegate).record(failedAgain, context);
+    verifyNoMoreInteractions(delegate);
+  }
+
+  @Test
+  void publishesARepeatAfterAnotherEventOfTheSameType() {
+    // Only the last event of a resource is compared, whatever the types of the events are, so
+    // the events of a resource keep the order in which they happened.
+    setMinIntervalSeconds(300L);
+    Context<?> context = contextOf("uid-1");
+    EventRecord pending = EventRecord.normal("KueueAdmissionPending", "queued");
+    EventRecord held = EventRecord.normal("SuspendHeld", "held");
+    EventRecord pendingAgain = EventRecord.normal("KueueAdmissionPending", "queued");
+
+    timedRecorder.record(pending, context);
+    timedRecorder.record(held, context);
+    timedRecorder.record(pendingAgain, context);
+
+    verify(delegate).record(pending, context);
+    verify(delegate).record(held, context);
+    verify(delegate).record(pendingAgain, context);
+    verifyNoMoreInteractions(delegate);
+  }
+
+  @Test
+  void dropsARepeatOfTheLastEventOnly() {
     setMinIntervalSeconds(300L);
     Context<?> context = contextOf("uid-1");
     EventRecord pending = EventRecord.normal("KueueAdmissionPending", "queued");
@@ -390,6 +464,22 @@ class ConfigurableEventRecorderTest {
     verify(delegate).record(pending, context);
     verify(delegate).record(failed, context);
     verifyNoMoreInteractions(delegate);
+  }
+
+  @Test
+  void publishesARepeatWhoseTypeChanged() {
+    // The type is part of the identity, so the same reason and message as a Warning rather than
+    // a Normal event is not a repeat.
+    setMinIntervalSeconds(300L);
+    Context<?> context = contextOf("uid-1");
+    EventRecord normal = EventRecord.normal("Changed", "same");
+    EventRecord warning = EventRecord.warning("Changed", "same");
+
+    timedRecorder.record(normal, context);
+    timedRecorder.record(warning, context);
+
+    verify(delegate).record(normal, context);
+    verify(delegate).record(warning, context);
   }
 
   @Test
@@ -496,14 +586,14 @@ class ConfigurableEventRecorderTest {
     setMinIntervalSeconds(9223372037L);
     timedRecorder.record(
         EventRecord.normal("KueueAdmissionPending", "queued"), contextOf("uid-1"));
-    assertThat(timedRecorder.trackedEventCount()).isEqualTo(1);
+    assertThat(timedRecorder.trackedResourceCount()).isEqualTo(1);
 
     setMinIntervalSeconds(60L);
     elapseSeconds(120L);
     timedRecorder.record(
         EventRecord.normal("KueueAdmissionPending", "queued"), contextOf("uid-2"));
 
-    assertThat(timedRecorder.trackedEventCount()).isEqualTo(1);
+    assertThat(timedRecorder.trackedResourceCount()).isEqualTo(1);
   }
 
   @Test
@@ -512,13 +602,13 @@ class ConfigurableEventRecorderTest {
     setMinIntervalSeconds(300L);
     timedRecorder.record(
         EventRecord.normal("KueueAdmissionPending", "queued"), contextOf("uid-1"));
-    assertThat(timedRecorder.trackedEventCount()).isEqualTo(1);
+    assertThat(timedRecorder.trackedResourceCount()).isEqualTo(1);
 
     setEventsEnabled(false);
     timedRecorder.record(
         EventRecord.normal("KueueAdmissionPending", "queued"), contextOf("uid-1"));
 
-    assertThat(timedRecorder.trackedEventCount()).isZero();
+    assertThat(timedRecorder.trackedResourceCount()).isZero();
   }
 
   @Test
@@ -526,12 +616,12 @@ class ConfigurableEventRecorderTest {
     setMinIntervalSeconds(300L);
     timedRecorder.record(
         EventRecord.normal("KueueAdmissionPending", "queued"), contextOf("uid-1"));
-    assertThat(timedRecorder.trackedEventCount()).isEqualTo(1);
+    assertThat(timedRecorder.trackedResourceCount()).isEqualTo(1);
 
     setMinIntervalSeconds(0L);
     timedRecorder.record(
         EventRecord.normal("KueueAdmissionPending", "queued"), contextOf("uid-1"));
 
-    assertThat(timedRecorder.trackedEventCount()).isZero();
+    assertThat(timedRecorder.trackedResourceCount()).isZero();
   }
 }

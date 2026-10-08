@@ -34,6 +34,7 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
+import java.io.IOException;
 import java.net.SocketException;
 import java.time.Duration;
 import java.time.Instant;
@@ -116,6 +117,10 @@ class AppInitStepTest {
   // docs/configuration.md and docs/spark_custom_resources.md both state as 30 minutes.
   private static final ReconcileProgress SUSPEND_HOLD_PROGRESS =
       ReconcileProgress.completeAndRequeueAfter(Duration.ofMinutes(30));
+
+  // fabric8 reports a failure without any response, e.g. a broken connection, with this code, and
+  // ReconcilerUtils#isTransientError then classifies it by its cause.
+  private static final int NO_RESPONSE_CODE = -1;
 
   private final ConfigMap preResourceConfigMapSpec =
       new ConfigMapBuilder()
@@ -572,12 +577,12 @@ class AppInitStepTest {
   }
 
   @ParameterizedTest
-  @ValueSource(ints = {503, 429})
+  @ValueSource(ints = {503, 429, NO_RESPONSE_CODE})
   void suspendedAppWithUnverifiableDriverIsNotHeld(int code) {
     // A failed verification is not an answer: the driver of this attempt may be live, so the app
     // must not be held with an event claiming that none was requested, nor for the whole suspend
-    // hold interval. Like a transport level failure, a throttled read publishes no event, which
-    // would only add load to an overloaded API server.
+    // hold interval. Neither a transport level failure, e.g. a broken connection, nor a
+    // throttled read publishes an event, which would only add load to an overloaded API server.
     AppInitStep appInitStep = new AppInitStep();
     SparkAppContext mockContext = mock(SparkAppContext.class);
     SparkAppStatusRecorder recorder = mock(SparkAppStatusRecorder.class);
@@ -585,8 +590,7 @@ class AppInitStepTest {
     application.setMetadata(applicationMetadata);
     application.getSpec().setSuspend(true);
     when(mockContext.getResource()).thenReturn(application);
-    when(mockContext.getCurrentAttemptDriverPod())
-        .thenThrow(new KubernetesClientException("unavailable", code, null));
+    when(mockContext.getCurrentAttemptDriverPod()).thenThrow(failedRead(code));
     when(mockContext.getEventRecorder()).thenReturn(eventRecorder);
 
     ReconcileProgress progress = appInitStep.reconcile(mockContext, recorder);
@@ -2039,6 +2043,13 @@ class AppInitStepTest {
     ArgumentCaptor<EventRecord> captor = ArgumentCaptor.forClass(EventRecord.class);
     verify(eventRecorder, times(count)).record(captor.capture());
     return captor.getAllValues();
+  }
+
+  /** Returns the failure of a read answered with the given code, or not answered at all. */
+  private static KubernetesClientException failedRead(int code) {
+    return code == NO_RESPONSE_CODE
+        ? new KubernetesClientException("Connection reset", new IOException("broken pipe"))
+        : new KubernetesClientException("unavailable", code, null);
   }
 
   private void admitWorkload() {

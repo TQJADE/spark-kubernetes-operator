@@ -114,7 +114,7 @@ In addition, the operator publishes the following `Warning` events.
 | `KueueAdmissionRequestFailed` | Creating, reading or deleting a stale Kueue `Workload` fails, or the driver or master cannot be read before the admission is requested. Transport-level errors are skipped and retried every 5 seconds, while a persistent failure is retried with the default interval. |
 | `ClusterRequestFailed` | Applying the Services, StatefulSets, NetworkPolicy, HorizontalPodAutoscaler or PodDisruptionBudget of a `SparkCluster` fails in a way which may yet succeed, such as a throttled request or an internal server error from an admission webhook, so it is retried with the default interval instead of failing the cluster. Transport-level errors are skipped. |
 | `SuspendReleaseFailed` | Deleting the driver pod (`SparkApplication`), the master and worker StatefulSets or the HorizontalPodAutoscaler or PodDisruptionBudget of the workers (`SparkCluster`), or the Kueue `Workload` of a resource suspended while running fails, or its pods cannot be listed. A failure which may clear on its own, such as a timeout, is skipped. Every failure is retried with the default interval. |
-| `SuspendCheckFailed` | The driver of a suspended `SparkApplication`, or the master of a suspended `SparkCluster` which has not started yet, cannot be read to check whether it was requested, so the resource is neither held, which would release its Kueue `Workload`, nor started. Transport-level errors and throttled requests are skipped. Every such failure is retried with the default interval. While the failure lasts, it is republished on every reconciliation, subject to [`minIntervalSeconds`](#event-frequency). Once the check succeeds again, the next `SuspendHeld` event is published even within that interval, so that it supersedes this one. |
+| `SuspendCheckFailed` | The driver of a suspended `SparkApplication`, or the master of a suspended `SparkCluster` which has not started yet, cannot be read to check whether it was requested, so the resource is neither held, which would release its Kueue `Workload`, nor started. Transport-level errors and throttled requests are skipped. Every such failure is retried with the default interval. While the failure lasts, it is republished on every reconciliation, subject to [`minIntervalSeconds`](#event-frequency). Once the check succeeds again, the next `SuspendHeld` event is published even within that interval, so that it supersedes this one, and so is this one when the check fails again after that. |
 | `KueueResourceFlavorReadFailed` | Reading the `ResourceFlavor`s which Kueue assigned to an admitted `Workload` fails, so the node selector and the tolerations of the flavors cannot be applied. Transport-level errors are skipped and retried every 5 seconds, while a persistent failure is retried with the default interval. |
 | `KueuePodsReadyUpdateFailed` | Recording the `PodsReady` condition on the Kueue `Workload` of a running `SparkApplication` or `SparkCluster` fails, e.g. without the permission for the `workloads/status` subresource, so Kueue may evict it by a `PodsReadyTimeout`, which releases it and queues it again, a `SparkApplication` with a new attempt, even if its pods are ready. Transport-level errors and conflicts are skipped. A `SparkCluster` retries them every 5 seconds and a persistent failure with the default interval, while a `SparkApplication` retries any failure with its next reconciliation, so that the recording does not hold back the observation of its driver. See [Kueue](spark_custom_resources.md#kueue). |
 | `KueueDisabled` | A `SparkApplication` or `SparkCluster` labeled with `kueue.x-k8s.io/queue-name` is not queued, since `spark.kubernetes.operator.kueue.enabled` is disabled, so the driver (or master and worker) is requested without the Kueue admission. |
@@ -151,8 +151,8 @@ invalid expression, so use `.*` to exclude all reasons.
 
 ### Event frequency
 
-Independently of that, the operator publishes an event with the same `reason` **and the same
-`message`** on the same resource at most once every
+Independently of that, the operator drops an event which repeats the last event on the same
+resource, with the same `type`, `reason` **and `message`**, within
 `spark.kubernetes.operator.events.minIntervalSeconds` (5 minutes by default, dynamically
 overridable). The two options differ in kind: `excludedReasons` blocks a `reason` permanently,
 while this one only limits how often an unchanged event is repeated. Set it to `0` to publish
@@ -162,16 +162,18 @@ every event.
 spark.kubernetes.operator.events.minIntervalSeconds=300
 ```
 
-The first event of a `reason` on a resource is always published right away, so a rare event such
-as a failure is never delayed. Only a repeat that says exactly what the last one said is dropped:
-such a repeat merely bumps the `count` of the one `Event` object, yet still costs a read and a
-write on the API server. A repeat whose `message` differs is always published, because the
-operator rewrites the `message` of the existing `Event`, so the current cause of a failure and the
-`SuspendHeld` message that retracts a stale `KueueAdmissionPending` keep reaching the user.
-Likewise, a `Normal` event which repeats after a `Warning` event on the same resource is published,
-since it says that the warning no longer applies, e.g. `SuspendHeld` once the check which
-`SuspendCheckFailed` reported succeeds again. The resource is identified by its `metadata.uid`, so a resource that reuses the name of a deleted one
-starts over.
+The first event of a resource is always published right away, so a rare event such as a failure
+is never delayed. Only a repeat that says exactly what the last one said is dropped: such a repeat
+merely bumps the `count` of the one `Event` object, yet still costs a read and a write on the API
+server. A repeat whose `message` differs is always published, because the operator rewrites the
+`message` of the existing `Event`, so the current cause of a failure and the `SuspendHeld` message
+that retracts a stale `KueueAdmissionPending` keep reaching the user. Only the last event of a
+resource is compared, so any other event on the resource in between ends the interval, and the
+events of a resource keep the order in which they happened. For example, when the check which
+`SuspendCheckFailed` reports fails, succeeds and fails again, the `SuspendHeld` in between and the
+second `SuspendCheckFailed` are both published, so the newest event always tells the current
+condition. The resource is identified by its `metadata.uid`, so a resource that reuses the name of
+a deleted one starts over.
 
 An event is only published when a reconciliation emits it, so the effective period is this
 interval **rounded up to the next repeat**, not the interval itself. With the defaults,
