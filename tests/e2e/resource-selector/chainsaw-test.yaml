@@ -27,9 +27,9 @@ spec:
         - name: SPARK_APPLICATION_NAME
           value: "spark-example-resource-selector"
         - name: SPARK_VERSION
-          value: "4.2.0"
+          value: "4.3.0"
         - name: IMAGE
-          value: "apache/spark:4.2.0-scala"
+          value: "apache/spark:4.3.0-scala"
   steps:
     - name: install-spark-application-and-apply-label
       try:
@@ -104,6 +104,7 @@ spec:
         - podLogs:
             namespace: default
             selector: app.kubernetes.io/component=operator-deployment,app.kubernetes.io/name=spark-kubernetes-operator
+            tail: -1
         - describe:
             apiVersion: spark.apache.org/v1
             kind: SparkApplication

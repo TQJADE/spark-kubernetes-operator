@@ -50,6 +50,13 @@ public final class Constants {
   /** The label for the Kueue WorkloadPriorityClass name. */
   public static final String LABEL_WORKLOAD_PRIORITY_CLASS = "kueue.x-k8s.io/priority-class";
 
+  /**
+   * The annotation which lets Kueue queue a SparkApplication with dynamic allocation by reserving
+   * the quota of `spark.dynamicAllocation.maxExecutors` executors, if set to `true`.
+   */
+  public static final String ANNOTATION_KUEUE_RESERVE_MAX_EXECUTORS =
+      "spark.operator/kueue-reserve-max-executors";
+
   /** The API group for Kueue resources. */
   public static final String KUEUE_API_GROUP = "kueue.x-k8s.io";
 
@@ -230,6 +237,36 @@ public final class Constants {
   public static final String EXECUTOR_LAUNCH_TIMEOUT_MESSAGE =
       "The Spark application failed to get enough executors in the given time threshold.";
 
+  /**
+   * Message indicating that the application is suspended by spec.suspend after its driver was
+   * requested.
+   */
+  public static final String APP_SUSPENDED_MESSAGE =
+      "Application is suspended by spec.suspend, so its driver and executors are being released. "
+          + "Setting spec.suspend to false resumes it with a new attempt once they are released.";
+
+  /**
+   * Message indicating that the suspended application is resumed by clearing spec.suspend, with a
+   * new attempt.
+   */
+  public static final String APP_RESUMED_MESSAGE =
+      "Application is resumed as spec.suspend is set to false, so a new attempt starts from "
+          + "scratch.";
+
+  /**
+   * Message indicating that the application is evicted by Kueue after its driver was requested,
+   * which is followed by the reason and the message of the eviction.
+   */
+  public static final String APP_EVICTED_MESSAGE =
+      "Application is evicted by Kueue, so its driver and executors are being released before its "
+          + "Workload. It is queued again with a new attempt then, or once the Workload is "
+          + "reactivated if it was deactivated.";
+
+  /** Message indicating that the application evicted by Kueue is submitted again. */
+  public static final String APP_REQUEUED_MESSAGE =
+      "Application is submitted again after its eviction by Kueue, so a new attempt starts from "
+          + "scratch.";
+
   // Spark Cluster Messages
   /** Message indicating a failure to request the Spark cluster from the scheduler backend. */
   public static final String CLUSTER_SCHEDULE_FAILURE_MESSAGE =
@@ -274,12 +311,12 @@ public final class Constants {
       "Cluster is submitted again after its eviction by Kueue.";
 
   /**
-   * Message indicating that the cluster failed after SchedulingFailure, whose message tells the
-   * cause.
+   * Message indicating that the resources of the cluster are released after SchedulingFailure,
+   * whose message tells the cause.
    */
-  public static final String CLUSTER_FAILED_AFTER_SCHEDULING_FAILURE_MESSAGE =
-      "Cluster failed, since requesting its resources failed. See the preceding "
-          + "SchedulingFailure state for the cause.";
+  public static final String CLUSTER_RELEASED_AFTER_SCHEDULING_FAILURE_MESSAGE =
+      "Cluster failed, since requesting its resources failed, and they are released. See the "
+          + "preceding SchedulingFailure state for the cause.";
 
   /** Message indicating that the cluster status cannot be processed. */
   public static final String UNKNOWN_CLUSTER_STATE_MESSAGE = "Cannot process cluster status.";

@@ -51,12 +51,12 @@ spec:
     spark.dynamicAllocation.enabled: "true"
     spark.dynamicAllocation.maxExecutors: "3"
     spark.kubernetes.authenticate.driver.serviceAccountName: "spark"
-    spark.kubernetes.container.image: "apache/spark:4.2.0-scala"
+    spark.kubernetes.container.image: "apache/spark:4.3.0-scala"
   applicationTolerations:
     resourceRetainPolicy: OnFailure
     ttlAfterStopMillis: 10000
   runtimeVersions:
-    sparkVersion: "4.2.0"
+    sparkVersion: "4.3.0"
 ```
 
 After application is submitted, Operator will add status information to your application based on
@@ -534,17 +534,23 @@ Both `SparkApplication` and `SparkCluster` support `.spec.suspend`. When it is s
 the driver pod or the master / worker StatefulSets are requested, the operator keeps the resource in
 its initializing state (`Submitted`, or `ScheduledToRestart` for an application that is scheduled to
 restart) and does not request them. Setting it back to `false` resumes the regular lifecycle. A
-running `SparkCluster` is stopped instead, as described below.
+running `SparkApplication` or `SparkCluster` is stopped instead, as described below.
 
 `Submitted` here is the operator's in-memory view. For a valid resource created with
 `suspend: true`, the initial `Submitted` status is not persisted to the API server, so
 `kubectl get` shows an empty `Current State` and no state transition events are published until
 initialization resumes. Instead, the `SuspendHeld` [event](configuration.md#kubernetes-events) is
-published when enabled. Since the status is not there to fall back on, it is republished every 30
+published by default. Since the status is not there to fall back on, it is republished every 30
 minutes by default while the hold lasts, so that it outlives the event retention of the API
-server. An application held later, in `ScheduledToRestart`, keeps the status its previous attempt
-already wrote and gets the same event, since that status says that a restart is due, not that the
-next attempt is withheld.
+server. An application held later, in `ScheduledToRestart`, or in `Submitted` after it was resumed
+as described below, keeps the status which was already written and gets the same event, since that
+status says that a restart is due or that the application is resumed, not that the next attempt is
+withheld. If the driver, or the master of a `SparkCluster` which has not started yet, cannot be
+read to check whether it was requested already, e.g. since the API server rejects the read, the
+resource is neither held nor started, and the `SuspendCheckFailed` event is published instead by
+default, until the check succeeds. A failure at the transport level, such as a timeout, or a
+throttled read is retried without the event. Once the check succeeds again, the next `SuspendHeld`
+event is published right away and supersedes it.
 
 ``` yaml
 apiVersion: spark.apache.org/v1
@@ -556,20 +562,43 @@ spec:
   mainClass: "org.apache.spark.examples.SparkPi"
   jars: "local:///opt/spark/examples/jars/spark-examples.jar"
   runtimeVersions:
-    sparkVersion: "4.2.0"
+    sparkVersion: "4.3.0"
 ```
 
-* For a `SparkApplication`, `suspend` only takes effect before the driver resources are requested.
-  Setting it to `true` on a running application does not stop the current attempt. If the
-  application is configured to restart, the next attempt is held until `suspend` is set back to
-  `false`.
+* Setting it to `true` on a `SparkApplication` whose driver is requested, i.e. from
+  `DriverRequested` to `RunningWithBelowThresholdExecutors`, stops its current attempt. The
+  application enters `Suspended` first, and then the operator deletes its driver pod, which deletes
+  its executor pods and the other resources which the driver owns, e.g. its ConfigMaps and
+  Services, like at the end of an attempt, whatever its `resourceRetainPolicy` is. The progress of
+  the attempt is lost. An attempt whose driver has completed or failed by then ends as usual
+  instead, and if the application is configured to restart, its next attempt is held as above. A
+  failure to delete the driver pod or the Kueue `Workload`, other than one which may clear on its
+  own, publishes the `SuspendReleaseFailed` [event](configuration.md#kubernetes-events) by default.
+* Setting it back to `false` starts a new attempt of the application from `Submitted` once its
+  driver and executor pods are gone and its Kueue `Workload`, if any, is released. A pod which is
+  still terminating `forceTerminationGracePeriodMillis` after its grace period ended, e.g. on a lost
+  node, no longer holds the application, and a driver pod is force deleted then. This is measured
+  per pod, so that the pods are waited for even if deleting them failed or started late. The new
+  attempt runs the application again from scratch with its current spec. Like a restart, it gets
+  the next attempt ID, and with
+  `spark.kubernetes.operator.reconciler.trimStateTransitionHistoryEnabled`, the state transition
+  history of the suspended attempt moves to `previousAttemptSummary`. The attempt ID is part of the
+  names of its driver resources unless `spark.app.id` is set, while the resources which the spec
+  names, e.g. through `configMapSpecs`, keep their names. Unlike a restart, it starts without the
+  restart backoff and does not count against the restart limits, so the restart counters stay as
+  they are, and it starts even with `restartPolicy: Never`. Only the counter of consecutive
+  scheduling failures starts over, since the driver of the suspended attempt was requested.
+  `restartCounterResetMillis` and the timeouts of `applicationTimeoutConfig` apply to the new
+  attempt on its own, so neither the run before the suspension nor the time suspended counts.
 * Setting it to `true` on a running `SparkCluster` (`RunningHealthy`) stops it, since a cluster
   runs until it is deleted and has no other way to give its resources back. The cluster enters
   `Suspended` first, and then the operator deletes its master and worker StatefulSets, and the
   HorizontalPodAutoscaler and PodDisruptionBudget of its workers if any. Its Services and
   NetworkPolicy are kept. Any application running on the cluster is terminated with it, since there
   is no graceful decommission. A failure to delete them, other than one which may clear on its own,
-  publishes the `SuspendReleaseFailed` [event](configuration.md#kubernetes-events) when enabled.
+  publishes the `SuspendReleaseFailed` [event](configuration.md#kubernetes-events) by default. The
+  HorizontalPodAutoscaler and PodDisruptionBudget hold no quota, so they are deleted after the
+  Kueue `Workload`, if any, is released, and a failure to delete them does not hold the quota.
 * Setting it back to `false` moves the cluster to `Submitted` once its master and worker pods are
   gone and its Kueue `Workload`, if any, is released, and the master and workers are requested
   again from scratch, like a newly created cluster. Only pods labeled with the `master` or `worker`
@@ -579,13 +608,24 @@ spec:
   `SchedulingFailure`, as for a newly created cluster. With
   `spark.kubernetes.operator.reconciler.trimStateTransitionHistoryEnabled`, the resumed cluster drops
   the state transition history of its previous run, so that suspending it again and again keeps the
-  status bounded. Setting it to `true` again before the master is requested moves the cluster back
-  to `Suspended`. A pod which is still terminating 5 minutes after its grace period ended, e.g. on
-  a lost node, no longer holds the Kueue `Workload`, so that it does not hold the quota forever. The
-  cluster still stays `Suspended` until such a pod is gone, since it keeps the name of the master or
-  worker to create, and the message of its `Suspended` state names such pods.
-* An operator version without the `Suspended` state cannot read a `SparkCluster` which is
-  `Suspended`, so resume or delete such clusters before downgrading the operator.
+  status bounded. Setting it to `true` again moves the cluster back to `Suspended`. A pod which is
+  still terminating 5 minutes after its grace period ended, e.g. on a lost node, no longer holds the
+  Kueue `Workload`, so that it does not hold the quota forever. The cluster still stays `Suspended`
+  until such a pod is gone, since it keeps the name of the master or worker to create, and the
+  message of its `Suspended` state names such pods.
+* The `Suspended` state says why the resource is suspended in `status.currentState.suspendReason`:
+  `SpecSuspend` if it is held by `spec.suspend`, or `KueueEviction` if the eviction of its Kueue
+  `Workload` released it, see [Kueue](#kueue). The operator relies on this field, not on the
+  message, which is for users to read and may be reworded. `spec.suspend` takes precedence, so
+  setting it on a resource suspended by an eviction records another `Suspended` state with
+  `SpecSuspend`. A `Suspended` state without it is treated as `SpecSuspend`.
+* An operator version without the `Suspended` state cannot read a `SparkApplication` or a
+  `SparkCluster` whose status has it, even after the resource is resumed. A resumed
+  `SparkApplication` keeps it in its state transition history, or with
+  `spark.kubernetes.operator.reconciler.trimStateTransitionHistoryEnabled` in that of
+  `previousAttemptSummary`, and a resumed `SparkCluster` keeps it unless that setting drops the
+  history of its previous run. So delete such applications, and delete such clusters or resume the
+  suspended ones with that setting enabled, before downgrading the operator.
 * Deleting a suspended resource works as usual.
 * This is the building block for external job queueing systems. See [Kueue](#kueue) for the
   built-in integration.
@@ -597,19 +637,58 @@ labeled with `kueue.x-k8s.io/queue-name` is queued by [Kueue](https://kueue.sigs
 operator creates a Kueue `Workload` that describes the driver and executor (or master and worker)
 pod sets, and holds the creation of those resources until Kueue admits the `Workload`.
 
+See [kueue-single-clusterqueue-setup.yaml](../examples/kueue-single-clusterqueue-setup.yaml) for the
+queues the administrator sets up, and [pi-on-kueue.yaml](../examples/pi-on-kueue.yaml) and
+[cluster-on-kueue.yaml](../examples/cluster-on-kueue.yaml) for a `SparkApplication` and a
+`SparkCluster` labeled with the `LocalQueue` of the setup.
+
 ```yaml
 apiVersion: spark.apache.org/v1
 kind: SparkApplication
 metadata:
-  name: spark-pi
+  name: pi-on-kueue
   labels:
     kueue.x-k8s.io/queue-name: spark-queue
 spec:
   mainClass: "org.apache.spark.examples.SparkPi"
   jars: "local:///opt/spark/examples/jars/spark-examples.jar"
+  sparkConf:
+    spark.executor.instances: "1"
   runtimeVersions:
-    sparkVersion: "4.2.0"
+    sparkVersion: "4.3.0"
 ```
+
+The following table summarizes which Kueue features are supported. The items after it describe the
+behavior in detail, and
+[Kueue Admission and Workload Lifecycle](architecture.md#kueue-admission-and-workload-lifecycle)
+relates it to the reconciliation.
+
+| Feature                                                                   | Support             | Notes                                                                                                                                                                                                                                        |
+|---------------------------------------------------------------------------|---------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Kueue `v1beta2` API                                                       | Supported           | Kueue v0.20.0 or later is required, see [Compatibility](operations.md#compatibility).                                                                                                                                                        |
+| Queueing by the `kueue.x-k8s.io/queue-name` label                         | Supported           | Both `SparkApplication` and `SparkCluster` are queued if `spark.kubernetes.operator.kueue.enabled` is set, e.g. by `operatorRbac.kueue.enabled` of the Helm chart, see [Optional Prerequisites](operations.md#optional-prerequisites).       |
+| Waiting for the admission                                                 | Supported           | The resource stays in its initializing state without its driver (or master and workers), and the `KueueAdmissionPending` and `KueueAdmitted` [events](configuration.md#kubernetes-events) report the progress.                               |
+| Changing the queue label                                                  | Supported           | A change is followed until the `Workload` reserves quota, while the `ValidatingAdmissionPolicy` of the Helm chart rejects one once the resource started, unless it is `Suspended` or `ScheduledToRestart`.                                   |
+| `Workload` priority                                                       | Supported           | The `WorkloadPriorityClass` of the `kueue.x-k8s.io/priority-class` label takes precedence over the `priorityClassName` of the pod templates and then the `globalDefault` `PriorityClass`, like Kueue built-in integrations.                  |
+| `ResourceFlavor` node labels and tolerations                              | Supported           | The `nodeLabels` and `tolerations` of the flavors which Kueue assigns to a pod set are added to its pods, like Kueue built-in integrations.                                                                                                  |
+| Admission checks, e.g. `ProvisioningRequest`                              | Supported           | The labels, annotations, node selector and tolerations in the `podSetUpdates` of the checks are added to the pods once Kueue admits the `Workload`.                                                                                          |
+| Preemption and other evictions                                            | Supported           | An evicted resource, e.g. a preempted one or one whose `ClusterQueue` is stopped with `HoldAndDrain`, is queued again with a new `Workload`, and a running one is released through `Suspended` first.                                        |
+| `Workload` deactivation, e.g. `kueuectl stop workload`                    | Supported           | A resource waits while its `Workload` is deactivated, and a running one is released through `Suspended` and queued again once the `Workload` is reactivated.                                                                                 |
+| `waitForPodsReady`                                                        | Supported           | The operator records the `PodsReady` condition once the driver and `spark.executor.instances` executors, or the master and workers, are ready, and handles a `PodsReadyTimeout` like any other eviction, see below for dynamic allocation.   |
+| `spec.suspend`                                                            | Supported           | It takes precedence over the queueing, so that a suspended resource releases its `Workload`, see [Suspend](#suspend).                                                                                                                        |
+| Releasing the quota of an application attempt                             | Supported           | The `Workload` is deleted once the driver and executor pods of the attempt are gone, or gets the `Finished` condition when a `Succeeded`, `Failed` or `DriverEvicted` application [retains its resources](#delete-resources-on-termination). |
+| Requeuing backoff after an eviction                                       | Partially supported | The resource waits for the backoff which Kueue records, but its new `Workload` starts the requeue count over, so the backoff does not grow and a `backoffLimitCount` above 0 never deactivates it.                                           |
+| Dynamic allocation (`spark.dynamicAllocation.enabled`)                    | Partially supported | Only with the `spark.operator/kueue-reserve-max-executors: "true"` annotation, which reserves `spark.dynamicAllocation.maxExecutors` executors of the default resource profile, see below. Otherwise, it fails with `SchedulingFailure`.     |
+| `recoveryTimeout` of `waitForPodsReady`                                   | Not supported       | The `PodsReady` condition stays `True` when a pod is lost later, e.g. an executor which Spark replaces.                                                                                                                                      |
+| Maximum execution time (`kueue.x-k8s.io/max-exec-time-seconds`)           | Not supported       | Use the Spark native `spark.driver.timeout` instead, as in [pi-with-driver-timeout.yaml](../examples/pi-with-driver-timeout.yaml).                                                                                                           |
+| Partial admission                                                         | Not supported       | The pod sets of a `Workload` have no `minCount`, so Kueue admits all the requested pods or none.                                                                                                                                             |
+| Topology Aware Scheduling                                                 | Not supported       | The operator applies neither the topology assignment nor the scheduling gate of Kueue to the pods.                                                                                                                                           |
+| MultiKueue                                                                | Not supported       | `SparkApplication` and `SparkCluster` have no `spec.managedBy` field, which MultiKueue needs to run them on a worker cluster.                                                                                                                |
+| Elastic workloads (`Workload` slices)                                     | Not supported       | A resource has one `Workload` whose pod set counts are fixed.                                                                                                                                                                                |
+| `manageJobsWithoutQueueName` and `managedJobsNamespaceSelector`           | Not supported       | Kueue does not manage the Spark custom resources itself, so a resource without the `kueue.x-k8s.io/queue-name` label is not queued and starts right away.                                                                                    |
+| Defaulting the queue name to the `default` `LocalQueue` of the namespace  | Not supported       | A resource without the `kueue.x-k8s.io/queue-name` label is not queued even if its namespace has a `LocalQueue` named `default`, so set the label explicitly, e.g. `kueue.x-k8s.io/queue-name: default`.                                     |
+| `SparkCluster` with `minWorkers < maxWorkers`                             | Not supported       | Such a `SparkCluster` fails with `SchedulingFailure` instead of being queued.                                                                                                                                                                |
+| Pod template files (`spark.kubernetes.{driver,executor}.podTemplateFile`) | Not supported       | A `SparkApplication` whose pod template is set only in such a file fails with `SchedulingFailure`, so set it in the [spec](#pod-template-support) instead.                                                                                   |
 
 * The Helm chart sets `spark.kubernetes.operator.kueue.enabled` together with the Kueue RBAC rules
   when `operatorRbac.kueue.enabled` is set. Kueue and its `LocalQueue` must exist as well. See
@@ -617,7 +696,7 @@ spec:
   label is ignored, so the resource is not queued and starts right away, and the operator does
   not access any Kueue resource, like Kueue ignores a job whose integration is not enabled. Since
   the author of the resource may not see the operator configuration, the `KueueDisabled` warning
-  [event](configuration.md#kubernetes-events) is published when enabled.
+  [event](configuration.md#kubernetes-events) is published by default.
 * The `Workload` is named `<lower-cased kind>-<resource name>` and is owned by the Spark resource,
   so it is garbage collected along with it.
 * Like Kueue built-in integrations, the `Workload` gets the priority of the `WorkloadPriorityClass`
@@ -634,7 +713,7 @@ spec:
   Like `spec.suspend`, the initial `Submitted` status of the first attempt is not persisted to the
   API server, so `kubectl get` shows an empty `Current State` and no state transition events are
   published until the `Workload` is admitted. Instead, the `KueueAdmissionPending` and
-  `KueueAdmitted` [events](configuration.md#kubernetes-events) are published when enabled. Since
+  `KueueAdmitted` [events](configuration.md#kubernetes-events) are published by default. Since
   the status is not there to fall back on, the pending event is republished while the `Workload`
   waits, so that it outlives the event retention of the API server. Use `kubectl get workload` to
   see the admission status. If the spec changes while waiting, the
@@ -664,7 +743,7 @@ spec:
   templates. A missing request defaults to the limit, or else to 1 CPU and `SPARK_DAEMON_MEMORY`
   plus overhead. A worker uses `SPARK_WORKER_CORES` for the CPU and adds `SPARK_WORKER_MEMORY` to
   the memory when they are set. A `SparkCluster` keeps the quota until it is deleted, suspended or
-  evicted.
+  evicted, or until it fails to request its master and workers, see [Spark Cluster](#spark-cluster).
   Set a cpu and memory request or limit on the `worker` container, or `SPARK_WORKER_CORES` and
   `SPARK_WORKER_MEMORY`: a worker with none of them advertises the whole node to its executors,
   well above the default the `Workload` requests.
@@ -674,31 +753,53 @@ spec:
   stay on the pods even if the `kueue.x-k8s.io/queue-name` label is removed after the driver (or
   master) was created, since the `Workload` keeps the quota until it is released with the
   resources. A node label that conflicts with the node selector of the pods fails the resource
-  with `SchedulingFailure`, and deletes the `Workload` unless its driver or master is running
-  already, whose pods still hold the quota it reserved. Only fixing the node selector or the flavor
+  with `SchedulingFailure`, and deletes the `Workload` right away unless its driver or master is
+  running already, whose pods still hold the quota it reserved until they are released. Only
+  fixing the node selector or the flavor
   resolves it: a restarted attempt requests the quota again and hits the same conflict, so an
   application which restarts on `SchedulingFailure` should bound the attempts with
   [`maxRestartOnSchedulingFailure`](#granular-restart-control). `ResourceFlavor`s are
   cluster-scoped, so reading them needs the rules which `operatorRbac.kueue.enabled` grants
   through the ClusterRole, hence `operatorRbac.clusterRole.create` as well. Until they can be
   read, the resource is held and the read is retried.
-* `spec.suspend` takes precedence. A suspended resource does not get a `Workload`, and suspending
-  a queued resource deletes its `Workload` to release the quota. Suspending a running
-  `SparkCluster` deletes its `Workload` only after its master and worker pods are gone, or are still
-  terminating 5 minutes after their grace period ended, since terminating pods occupy the quota.
-  The `Workload` is deleted even if the `kueue.x-k8s.io/queue-name` label was removed after the
-  admission. The resource is queued again when it is resumed with the `kueue.x-k8s.io/queue-name`
-  label.
+* Like Kueue built-in integrations, the `labels`, `annotations`, `nodeSelector` and `tolerations`
+  which the [admission checks](https://kueue.sigs.k8s.io/docs/concepts/admission_check/) of the
+  `Workload` report for a pod set in `status.admissionChecks[].podSetUpdates` are added to its pods
+  as well, once all the checks are `Ready` and Kueue admits the `Workload`. The executor pods get
+  them through the executor pod template, like the flavors. So a resource can use a
+  [ProvisioningRequest](https://kueue.sigs.k8s.io/docs/concepts/admission_check/provisioning_request/)
+  admission check, whose `autoscaling.x-k8s.io/consume-provisioning-request` and
+  `autoscaling.x-k8s.io/provisioning-class-name` annotations, and the node selector which its
+  `ProvisioningRequestConfig` sets, bind the pods to the capacity provisioned for them. The
+  operator reads them from the `Workload`, so they need no further RBAC rules. Like Kueue, an
+  update must not change a value which the flavors or an earlier admission check set, nor a value
+  of the node selector, labels or annotations of the pods, and such a conflict fails the resource
+  like a node label conflict above. The labels and annotations which Spark sets on the driver and
+  executor pods itself, e.g. `spark-role` or the ones of
+  `spark.kubernetes.{driver,executor}.{label,annotation}.*`, are not checked, and Spark's value
+  wins over an update of the same key.
+* `spec.suspend` takes precedence. A suspended resource does not get a `Workload`, and suspending a
+  queued resource deletes its `Workload` to release the quota. While its driver, or the master of a
+  `SparkCluster` which has not started yet, cannot be read to check whether it was requested, as
+  described in [Suspend](#suspend), the `Workload` is kept instead, and a pending one may still be
+  admitted. Suspending a running `SparkApplication` deletes its `Workload` only after its driver and
+  executor pods are gone, or are still terminating `forceTerminationGracePeriodMillis` after their
+  grace period ended, and suspending a running `SparkCluster` only after its master and worker pods
+  are gone, or are still terminating 5 minutes after their grace period ended, since terminating
+  pods occupy the quota. The `Workload` is deleted even if the `kueue.x-k8s.io/queue-name` label was
+  removed after the admission. The resource is queued again when it is resumed with the
+  `kueue.x-k8s.io/queue-name` label.
 * Like the webhooks of Kueue built-in integrations, which let only a suspended job change its queue,
   the Helm chart installs a `ValidatingAdmissionPolicy` with `operatorRbac.kueue.enabled`. It
   rejects an update that adds, changes or removes the `kueue.x-k8s.io/queue-name` label of a
   `SparkApplication` or a `SparkCluster` once its status says that it started, since the `Workload`
   admitted for it keeps its quota in that queue. The label may change again when a
   `SparkApplication` is `ScheduledToRestart`, whose next attempt is queued with a new `Workload`, or
-  when a `SparkCluster` is `Suspended`. So the label of a terminated resource, e.g. `Failed`, stays
-  as it was. To move a running `SparkCluster` to another queue, set `spec.suspend` to `true`, change
-  the label once the cluster is `Suspended`, and then resume it, while a running `SparkApplication`
-  moves with its next attempt. Before a resource starts, the operator follows the label as described
+  when a `SparkApplication` or a `SparkCluster` is `Suspended`. So the label of a terminated
+  resource, e.g. `Failed`, stays as it was. To move a running resource to another queue, set
+  `spec.suspend` to `true`, change the label once the resource is `Suspended`, and then resume it,
+  while a running `SparkApplication` also moves with its next attempt after a restart. Before a
+  resource starts, the operator follows the label as described
   above. The policy reads only the status, so a resource whose first status is not persisted yet,
   e.g. after the update following the request of its driver or master failed, looks like it has not
   started. Its label may still change then, while the operator keeps the admitted `Workload` of such
@@ -710,17 +811,41 @@ spec:
 * Once the integration is disabled or the access of the operator to `Workload`s is revoked, e.g.
   by disabling `operatorRbac.kueue.enabled`, the operator no longer deletes them, and a `Workload`
   left behind keeps its quota until its owner is deleted. While the integration stays enabled
-  without the access, a suspended `SparkCluster` does not resume, and a stopping
-  `SparkApplication` with a `Workload` neither terminates nor restarts, until its `Workload` is
-  gone or the access is restored. Before disabling either, let the queued
-  `SparkApplication`s finish or suspend those which have not started yet, and suspend the queued
-  `SparkCluster`s, so that the operator releases their `Workload`s itself. Then list the remaining
-  ones with `kubectl get workloads -A -l spark.operator/spark-app-name` and
+  without the access, a suspended `SparkApplication` or `SparkCluster` does not resume, a stopping
+  `SparkApplication` neither terminates nor restarts, and a `SparkCluster` in `SchedulingFailure`
+  does not terminate, until the access is restored or the integration is disabled, since the
+  operator keeps deleting their `Workload`s by name, which is denied even once a `Workload` is
+  gone. Before disabling either, let the queued
+  `SparkApplication`s finish or suspend them, and suspend the queued
+  `SparkCluster`s, so that the operator releases their `Workload`s itself. A suspended resource
+  whose driver, or whose master which has not started yet, cannot be read keeps its `Workload`
+  until it can, see [Suspend](#suspend). Then list the remaining ones with
+  `kubectl get workloads -A -l spark.operator/spark-app-name` and
   `kubectl get workloads -A -l spark.operator/spark-cluster-name`, and delete only those whose
-  owner has no running pods, e.g. of a `Failed` `SparkCluster`.
-* Dynamic allocation, a `SparkCluster` with `minWorkers < maxWorkers`, and pod template files set
-  through `spark.kubernetes.{driver,executor}.podTemplateFile` are not supported yet. Such a
-  resource fails with `SchedulingFailure` instead of being queued.
+  owner has no running pods.
+* A `SparkCluster` with `minWorkers < maxWorkers` and pod template files set through
+  `spark.kubernetes.{driver,executor}.podTemplateFile` are not supported yet. Such a resource fails
+  with `SchedulingFailure` instead of being queued.
+* Since Kueue cannot resize the quota of an admitted `Workload` yet, a `SparkApplication` with
+  dynamic allocation fails with `SchedulingFailure` unless it is annotated with
+  `spark.operator/kueue-reserve-max-executors: "true"`, which is ignored without dynamic
+  allocation. As a stopgap, its `Workload` then reserves the quota of
+  `spark.dynamicAllocation.maxExecutors` executors for the whole attempt. An application whose
+  executors are not pods, see below, needs no annotation.
+  * `spark.dynamicAllocation.maxExecutors` must be set, since it is unlimited by default. Like
+    Spark requires, it must not be less than the initial executors, the maximum of
+    `spark.dynamicAllocation.minExecutors`, `spark.dynamicAllocation.initialExecutors` and
+    `spark.executor.instances`.
+  * Kueue admits the application only once the maximum fits, and preemption, fair sharing and a
+    `ProvisioningRequest` admission check count the maximum even while fewer executors run.
+  * The reservation bounds only the executors of the default resource profile. Spark applies
+    `spark.dynamicAllocation.maxExecutors` to each `ResourceProfile` separately, so with
+    stage-level scheduling, e.g. `RDD.withResources`, the executors of another profile run outside
+    the quota.
+  * Like the integration of Kueue for the Kubeflow Spark Operator, which also uses
+    `spark.dynamicAllocation.minExecutors` as the `PodsReady` threshold, the `PodsReady` condition
+    waits only for the driver and that many executors. So with the default minimum of 0, a
+    `PodsReadyTimeout` does not catch executors which cannot be scheduled.
 * A resource whose `Workload` is deactivated (`spec.active` set to `false`), e.g. by
   `kueuectl stop workload`, before its driver (or master) is requested waits until the `Workload`
   is reactivated, since Kueue neither counts nor admits a deactivated `Workload`, and the
@@ -739,7 +864,10 @@ spec:
   evicted `Workload` until then, so the operator then deletes it, and the resource is queued again
   with a new `Workload`. Unlike Kueue built-in integrations, which keep the evicted
   `Workload`, the new `Workload` is ordered in its queue like a newly created one, and it starts
-  over the retry counts of its admission checks.
+  over the retry counts of its admission checks and the requeue count of its `PodsReadyTimeout`s.
+  So their backoff does not grow with each eviction, e.g. it stays at
+  `requeuingStrategy.backoffBaseSeconds` (60 seconds by default) for a `PodsReadyTimeout`, and a
+  `requeuingStrategy.backoffLimitCount` above 0 never deactivates the `Workload`.
 * A running `SparkCluster` whose `Workload` Kueue evicts, e.g. to preempt it for a workload of a
   higher priority or since its `ClusterQueue` is stopped, is released like on `spec.suspend`
   without setting it. The cluster enters `Suspended` with a message giving the reason of the
@@ -752,8 +880,9 @@ spec:
   counting its quota right away. Unlike an evicted one, the operator keeps the `Workload`, so the
   cluster stays `Suspended` until the `Workload` is reactivated, and then it is queued again.
 * Like Kueue built-in integrations, the operator records the `PodsReady` condition on the
-  `Workload` once as many pods of each of its pod sets as requested are ready: the driver and
-  `spark.executor.instances` executors of a `SparkApplication`, regardless of the executor
+  `Workload` once enough pods of each of its pod sets are ready: the driver and
+  `spark.executor.instances` executors of a `SparkApplication`, or with dynamic allocation,
+  `spark.dynamicAllocation.minExecutors` executors as above, regardless of the executor
   thresholds of its `applicationTolerations`, or the master and workers of a `SparkCluster`. The
   `Workload` of an application whose executors are not pods has the driver pod set only, and so
   requests no quota for them, e.g. with the `spark://` master URL of a `SparkCluster` as
@@ -764,21 +893,38 @@ spec:
   the pods are ready. Unlike Kueue built-in integrations, the condition stays `True` when a pod is
   lost later, e.g. an executor which Spark replaces, so the `recoveryTimeout` does not apply.
 * A `PodsReadyTimeout` of a running `SparkCluster`, whose master or workers are not ready in time,
-  is not acted on yet, and the `KueueEvictionIgnored` [event](configuration.md#kubernetes-events)
-  is published instead. Kueue keeps counting the quota of such a `Workload`, so suspend or delete
-  the cluster to release it. The `PodsReady` condition is still recorded once the master and
-  workers are ready, so that `blockAdmission` admits the next workload.
-* Preemption is not honored yet after the driver of a `SparkApplication` is requested, and neither
-  is a `PodsReadyTimeout`, e.g. of an application which runs with fewer executors than
-  `spark.executor.instances`, or a deactivation. The operator checks the admission only before it
-  creates the resources, so after a later eviction the driver and executors keep running, and
-  until the attempt stops, the `KueueEvictionIgnored` [event](configuration.md#kubernetes-events)
-  is published instead when enabled. An evicted `Workload` keeps its Kueue quota until the driver
-  and executors are released, so a workload which preempts the application waits until then,
-  while a deactivated one no longer counts against it. Since `spec.suspend` does not stop a
-  running attempt, delete the application to release its quota earlier. With `blockAdmission`, an
-  application whose pods are not all ready holds back every other workload until they are ready
-  or its quota is released as described above.
+  releases the cluster like any other eviction above, even if they are ready by now, as Kueue
+  built-in integrations do. So does a failure to record the `PodsReady` condition, e.g. without the
+  permission for the `workloads/status` subresource, which the `KueuePodsReadyUpdateFailed`
+  [event](configuration.md#kubernetes-events) reports. As the backoff does not grow, see above, a
+  cluster whose master or workers never get ready, e.g. since they cannot be scheduled, or whose
+  condition cannot be recorded, is admitted and evicted again and again until it is fixed,
+  suspended or deleted. With `blockAdmission`, it holds back every other workload from each
+  admission until its `Workload` is deleted after the backoff.
+* A `SparkApplication` whose driver is requested, i.e. from `DriverRequested` to
+  `RunningWithBelowThresholdExecutors`, is released like a running `SparkCluster` above when Kueue
+  evicts its `Workload`, e.g. to preempt it or by a `PodsReadyTimeout`, or deactivates it. The
+  application enters `Suspended` with a message giving the reason of the eviction, and the
+  operator deletes its driver pod, which deletes its executor pods. Like for a cluster, the
+  `Workload` is deleted once the pods are gone and its requeue backoff elapsed, or kept until it is
+  reactivated if it was deactivated, and then the application starts a new attempt from
+  `Submitted`, which is queued again with a new `Workload`. Like a resumed one, the new attempt
+  runs the application again from scratch and does not count against the restart limits, so it
+  starts even with `restartPolicy: Never`. An attempt whose driver has completed or failed by then
+  ends as usual instead, and `spec.suspend` takes precedence, so an application which is suspended
+  by it as well stays `Suspended` until it is resumed rather than being queued again.
+* Unlike without Kueue, a `SparkApplication` whose driver and `spark.executor.instances` executors
+  are not all ready within the `waitForPodsReady` timeout, e.g. since some executors cannot be
+  scheduled, does not keep running with fewer executors, even if its `applicationTolerations`
+  allow it, e.g. in `RunningWithPartialCapacity`. Its `Workload` requested the quota for all of
+  them, so the `PodsReadyTimeout` releases the application as above, and it runs again from
+  scratch with a new attempt, which waits for the quota of all of them again. Like such a cluster,
+  an application whose executors never get ready is admitted and evicted again and again, with a
+  new attempt each time, until it is fixed, suspended or deleted.
+* To limit the execution time of a `SparkApplication`, the Spark native `spark.driver.timeout` is
+  recommended instead of the `kueue.x-k8s.io/max-exec-time-seconds` label, which is not copied to
+  the `Workload`. It requires `spark.plugins=org.apache.spark.deploy.DriverTimeoutPlugin`, as in
+  [this example](../examples/pi-with-driver-timeout.yaml).
 
 ## Spark Cluster
 
@@ -796,4 +942,19 @@ that Spark may overwrite certain fields.
 
 The master and worker pods use `terminationGracePeriodSeconds: 0` by default to delete a
 `SparkCluster` faster, unless their pod templates set it. A longer grace period delays stopping
-a [suspended](#suspend) cluster and releasing its [Kueue](#kueue) quota accordingly.
+a [suspended](#suspend) or failed cluster and releasing its [Kueue](#kueue) quota accordingly.
+
+A `SparkCluster` whose resources cannot be requested, e.g. since a `ResourceQuota` or an admission
+webhook rejects one of them, fails with `SchedulingFailure`, whose message gives the cause, while a
+request which may yet succeed, such as a timeout, a throttled request or an internal server error,
+is retried. Then the operator deletes by name whatever it may have requested for the cluster: the
+master and worker StatefulSets and Services, the NetworkPolicy, and the HorizontalPodAutoscaler and
+PodDisruptionBudget of the workers. Once the master and worker pods are gone, or are still
+terminating 5 minutes after their grace period ended, it releases the [Kueue](#kueue) `Workload` of
+the cluster as well, and the cluster moves to `ResourceReleased`, which is not reconciled any
+further. So delete and recreate the cluster to request its resources again. A failure to delete
+them or the `Workload`, other than one which may clear on its own, publishes the
+`ClusterReleaseFailed` [event](configuration.md#kubernetes-events) by default, and the cluster stays
+in `SchedulingFailure` until the deletion succeeds. The Services, the NetworkPolicy, the
+HorizontalPodAutoscaler and the PodDisruptionBudget hold no quota, so they are deleted after the
+`Workload` is released, and a failure to delete them does not hold the quota.

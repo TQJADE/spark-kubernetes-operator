@@ -32,7 +32,6 @@ import java.io.IOException;
 import java.net.ServerSocket;
 import java.util.List;
 
-import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import io.fabric8.kubernetes.client.ConfigBuilder;
 import io.fabric8.kubernetes.client.KubernetesClient;
 import io.fabric8.kubernetes.client.KubernetesClientBuilder;
@@ -52,9 +51,6 @@ import org.apache.spark.k8s.operator.status.ApplicationStateSummary;
 import org.apache.spark.k8s.operator.status.ApplicationStatus;
 
 @EnableKubernetesMockClient
-@SuppressFBWarnings(
-    value = {"UWF_UNWRITTEN_FIELD", "NP_UNWRITTEN_FIELD"},
-    justification = "Unwritten fields are covered by Kubernetes mock client")
 class StatusRecorderTest {
 
   static final String DEFAULT_NS = "default";
@@ -237,6 +233,34 @@ class StatusRecorderTest {
             ApplicationStateSummary.DriverRequested.name(),
             ApplicationStateSummary.DriverStarted.name(),
             ApplicationStateSummary.DriverReady.name());
+  }
+
+  @Test
+  void publishesTheGivenMessageInTheEventAboutTheCurrentStateOnly() {
+    var testResource = getSparkApplication("1");
+    var context = contextFor(testResource);
+    expectStatusPatch(testResource, getSparkApplication("2"));
+
+    var requested =
+        new ApplicationStatus()
+            .appendNewState(
+                new ApplicationState(ApplicationStateSummary.DriverRequested, "requested"));
+    statusRecorder.persistStatus(context, requested);
+    String stackTrace = "SparkException: boom\n\tat Foo.bar(Foo.java:1)";
+    statusRecorder.persistStatus(
+        context,
+        requested
+            .appendNewState(new ApplicationState(ApplicationStateSummary.DriverStarted, "started"))
+            .appendNewState(new ApplicationState(ApplicationStateSummary.Failed, stackTrace)),
+        "SparkException: boom");
+
+    ArgumentCaptor<EventRecord> captor = ArgumentCaptor.forClass(EventRecord.class);
+    verify(mockEventRecorder, times(3)).record(captor.capture());
+    assertThat(captor.getAllValues())
+        .extracting(EventRecord::message)
+        .containsExactly("requested", "started", "SparkException: boom");
+    // The status keeps the message of the state
+    assertThat(testResource.getStatus().getCurrentState().getMessage()).isEqualTo(stackTrace);
   }
 
   @Test

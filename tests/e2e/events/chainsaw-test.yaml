@@ -18,9 +18,8 @@
 # Asserts the events published by the state transitions of a SparkApplication which succeeds, a
 # SparkApplication which fails, and a SparkCluster.
 #
-# Like the `suspend-events` suite, this suite requires an operator installed with
-# `spark.kubernetes.operator.events.enabled=true`, as the `events` CI mode does with
-# tests/e2e/helm/events-config-values.yaml. Run it locally with:
+# Like the `suspend-events` suite, this suite runs in the `events` CI mode, which installs the
+# operator with tests/e2e/helm/events-config-values.yaml. Run it locally with:
 #
 #   helm install spark --create-namespace \
 #     -f build-tools/helm/spark-kubernetes-operator/values.yaml \
@@ -42,7 +41,12 @@ spec:
   - name: succeeded-application-publishes-normal-events
     try:
     - apply:
-        file: spark-example-succeeded.yaml
+        bindings:
+          - name: SPARK_APP_NAMESPACE
+            value: default
+          - name: SPARK_APPLICATION_NAME
+            value: spark-job-succeeded-events-test
+        file: "../fixtures/spark-application/spark-example.yaml"
     - assert:
         bindings:
           - name: SPARK_APP_NAMESPACE
@@ -136,6 +140,7 @@ spec:
     - podLogs:
         selector: app.kubernetes.io/name=spark-kubernetes-operator
         namespace: default
+        tail: -1
     finally:
     - script:
         timeout: 30s
@@ -183,6 +188,7 @@ spec:
     - podLogs:
         selector: app.kubernetes.io/name=spark-kubernetes-operator
         namespace: default
+        tail: -1
     finally:
     - script:
         timeout: 30s
@@ -191,7 +197,12 @@ spec:
   - name: cluster-publishes-running-healthy-event
     try:
     - apply:
-        file: spark-cluster-example.yaml
+        bindings:
+          - name: SPARK_APP_NAMESPACE
+            value: default
+          - name: SPARK_CLUSTER_NAME
+            value: spark-cluster-events-test
+        file: "../fixtures/spark-cluster/spark-cluster-example.yaml"
     - assert:
         bindings:
           - name: SPARK_APP_NAMESPACE
@@ -225,6 +236,7 @@ spec:
     - podLogs:
         selector: app.kubernetes.io/name=spark-kubernetes-operator
         namespace: default
+        tail: -1
     finally:
     - script:
         timeout: 30s

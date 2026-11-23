@@ -33,6 +33,7 @@ rules:
       - update
       - patch
       - delete
+      - deletecollection
   - apiGroups:
       - "apps"
     resources:
@@ -45,6 +46,34 @@ rules:
       - update
       - patch
       - delete
+  - apiGroups:
+      - "apps"
+    resources:
+      - deployments
+    verbs:
+      - get
+      - create
+      - delete
+  - apiGroups:
+      - "apps"
+    resources:
+      - statefulsets/scale
+      - deployments/scale
+    verbs:
+      - get
+      - update
+  - apiGroups:
+      - ""
+    resources:
+      - pods/resize
+    verbs:
+      - patch
+  - apiGroups:
+      - "metrics.k8s.io"
+    resources:
+      - pods
+    verbs:
+      - get
 {{- end }}
 
 {{/*
@@ -192,8 +221,8 @@ metadata:
 spec:
   runtimeVersions:
     sparkVersion: "dummy"
-{{- end }}
 ---
+{{- end }}
 {{- end }}
 {{- if $workloadResources.sparkClusterSentinel.create }}
 {{- range $sentinelNs := .Values.workloadResources.sparkClusterSentinel.sentinelNamespaces.data }}
@@ -215,6 +244,6 @@ spec:
       initWorkers: 0
       minWorkers: 0
       maxWorkers: 0
-{{- end }}
 ---
+{{- end }}
 {{- end }}

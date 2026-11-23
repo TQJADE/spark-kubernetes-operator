@@ -23,11 +23,11 @@ spec:
   scenarios:
     - bindings:
         - name: "SPARK_VERSION"
-          value: "4.2.0"
+          value: "4.3.0"
         - name: "SCALA_VERSION"
           value: "2.13"
         - name: "IMAGE"
-          value: "apache/spark:4.2.0-python3"
+          value: "apache/spark:4.3.0-python3"
   steps:
     - name: install-spark-application
       try:
@@ -40,6 +40,8 @@ spec:
             file: pyspark-example.yaml
     - name: verify-common-created-resources
       bindings:
+        - name: SPARK_APPLICATION_NAME
+          value: (join('-', ['pyspark', replace_all(($SPARK_VERSION), '.', '-')]))
         - name: SPARK_DRIVER_POD_NAME
           value: (join('-', ['pyspark', replace_all(($SPARK_VERSION), '.', '-'), '0-driver']))
         - name: SPARK_EXECUTOR_POD_NAME
@@ -64,9 +66,11 @@ spec:
         - podLogs:
             selector: app.kubernetes.io/name=spark-kubernetes-operator
             namespace: default
+            tail: -1
         - podLogs:
-            selector: spark-app-name=spark
+            selector: (concat('spark.operator/spark-app-name=', $SPARK_APPLICATION_NAME))
             namespace: default
+            tail: -1
       finally:
         - script:
             bindings:
