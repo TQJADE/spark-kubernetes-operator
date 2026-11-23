@@ -112,7 +112,7 @@ a restarted application attempt, meanwhile. `AppInitStep` and `ClusterInitStep` 
 flowchart TD
     init([Submitted or ScheduledToRestart]) --> suspend{spec.suspend?}
     suspend -->|set, nothing requested yet| suspendHold[Release the Workload, SuspendHeld event]
-    suspend -->|unset, or requested already| queued{Queue label and Kueue enabled?}
+    suspend -->|unset, or a driver requested already| queued{Queue label and Kueue enabled?}
     queued -->|no| request[Request the driver, or the master and workers]
     queued -->|yes| requested{Driver or master requested already?}
     requested -->|yes| reapply[Apply the flavors of the earlier admission]
@@ -130,7 +130,8 @@ flowchart TD
 
 * `spec.suspend` comes first (`SuspendUtils`), so a suspended resource is held without a
   `Workload`, and suspending a queued one releases its `Workload`. A cluster resumed from
-  `Suspended` moves back to `Suspended` instead of being held. After the restart backoff of a
+  `Suspended`, or one whose master was requested already, moves to `Suspended` instead of being
+  held. After the restart backoff of a
   restarted attempt, `KueueWorkloadUtils` creates the `Workload` unless it exists, and finds it
   `ADMITTED`, `PENDING`, `BACKOFF` if it is evicted and its requeue backoff has not elapsed, or
   `STALE` if it is owned by another resource, still pending for an outdated spec, evicted after the
@@ -141,9 +142,10 @@ flowchart TD
   from, or to the pod templates of the master and worker `StatefulSet`s. Neither the custom
   resource nor the `Workload` is changed.
 * A driver or master which was requested already, e.g. when the status update after the request
-  failed, is not held and requests no admission, since it has to complete the initialization
-  rather than run unobserved. Its resources are applied again in that reconciliation, so the
-  flavors of the earlier admission are applied again as well, rather than dropped from them.
+  failed, is not held and requests no admission. A driver, or the master of a cluster which is not
+  suspended, has to complete the initialization rather than run unobserved. Its resources are
+  applied again in that reconciliation, so the flavors of the earlier admission are applied again
+  as well, rather than dropped from them. A suspended cluster goes to `Suspended` instead.
 * A hold changes no state. The initial `Submitted` state of a first attempt is not persisted to the
   API server until the next state, so `kubectl get` shows an empty `Current State`, and the
   `SuspendHeld`, `KueueAdmissionPending` and `KueueAdmitted`

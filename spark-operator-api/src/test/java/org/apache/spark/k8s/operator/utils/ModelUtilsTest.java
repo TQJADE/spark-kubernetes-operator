@@ -26,8 +26,11 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
+import io.fabric8.kubernetes.api.model.ConfigMap;
+import io.fabric8.kubernetes.api.model.ConfigMapBuilder;
 import io.fabric8.kubernetes.api.model.ContainerStatus;
 import io.fabric8.kubernetes.api.model.ContainerStatusBuilder;
+import io.fabric8.kubernetes.api.model.OwnerReferenceBuilder;
 import io.fabric8.kubernetes.api.model.Pod;
 import io.fabric8.kubernetes.api.model.PodTemplateSpec;
 import io.fabric8.kubernetes.api.model.PodTemplateSpecBuilder;
@@ -203,5 +206,53 @@ class ModelUtilsTest {
     spec.setDeploymentMode(DeploymentMode.ClusterMode);
     app.setSpec(spec);
     assertFalse(ModelUtils.isClientMode(app));
+  }
+
+  private static ConfigMap configMap(String uid, String... ownerUids) {
+    ConfigMapBuilder builder =
+        new ConfigMapBuilder().withNewMetadata().withName("cm").endMetadata();
+    if (uid != null) {
+      builder.editMetadata().withUid(uid).endMetadata();
+    }
+    for (String ownerUid : ownerUids) {
+      builder
+          .editMetadata()
+          .addToOwnerReferences(
+              new OwnerReferenceBuilder().withName("owner").withUid(ownerUid).build())
+          .endMetadata();
+    }
+    return builder.build();
+  }
+
+  @Test
+  void isOwnedByMatchesTheUidOfAnyOwnerReference() {
+    ConfigMap owner = configMap("uid-1");
+
+    assertTrue(ModelUtils.isOwnedBy(configMap(null, "uid-1"), owner));
+    assertTrue(ModelUtils.isOwnedBy(configMap(null, "other", "uid-1"), owner));
+  }
+
+  @Test
+  void isOwnedByRejectsAnotherUid() {
+    // e.g. a resource left by a deleted owner of the same name
+    assertFalse(ModelUtils.isOwnedBy(configMap(null, "deleted-uid"), configMap("uid-1")));
+  }
+
+  @Test
+  void isOwnedByRejectsAResourceWithoutOwnerReferences() {
+    // e.g. after the owner was deleted with --cascade=orphan, which removes the owner references
+    ConfigMap owner = configMap("uid-1");
+
+    assertFalse(ModelUtils.isOwnedBy(configMap(null), owner));
+    ConfigMap nullReferences = configMap(null);
+    nullReferences.getMetadata().setOwnerReferences(null);
+    assertFalse(ModelUtils.isOwnedBy(nullReferences, owner));
+  }
+
+  @Test
+  void isOwnedByRejectsAnOwnerWithoutUid() {
+    // A reference without a uid must not match an owner which has none either
+    assertFalse(ModelUtils.isOwnedBy(configMap(null, (String) null), configMap(null)));
+    assertFalse(ModelUtils.isOwnedBy(configMap(null, "uid-1"), configMap(null)));
   }
 }
